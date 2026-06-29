@@ -1,9 +1,10 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal
+from typing import List, Optional
+
+from pydantic import BaseModel
 
 
 class ChatMessage(BaseModel):
-    role: Literal["user", "assistant", "system", "tool"]
+    role: str
     content: str
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
@@ -12,7 +13,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: Optional[Literal["stop", "length", "tool_call"]] = None
+    finish_reason: Optional[str] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -26,7 +27,7 @@ class ChatCompletionResponse(BaseModel):
 class ChatCompletionChunkChoice(BaseModel):
     index: int
     delta: ChatMessage
-    finish_reason: Optional[Literal["stop", "length", "tool_call"]] = None
+    finish_reason: Optional[str] = None
 
 
 class ChatCompletionChunk(BaseModel):

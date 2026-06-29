@@ -20,19 +20,21 @@ class Agent:
     async def run(self, messages: List[ChatMessage]) -> ChatCompletionResponse:
         return await self.loop.run(messages)
 
-    async def run_stream(
+    def run_stream(
         self, messages: List[ChatMessage]
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
-        async for chunk in self.loop.run_stream(messages):
-            yield chunk
+        async def _stream() -> AsyncGenerator[ChatCompletionChunk, None]:
+            async for chunk in self.loop.run_stream(messages):
+                yield chunk
+
+        return _stream()
 
     async def chat(self, user_message: str) -> ChatCompletionResponse:
         messages = [ChatMessage(role="user", content=user_message)]
         return await self.run(messages)
 
-    async def chat_stream(
+    def chat_stream(
         self, user_message: str
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
         messages = [ChatMessage(role="user", content=user_message)]
-        async for chunk in self.loop.run_stream(messages):
-            yield chunk
+        return self.loop.run_stream(messages)
