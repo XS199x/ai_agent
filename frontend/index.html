@@ -234,6 +234,23 @@
       white-space: nowrap;
     }
 
+    .conv-meta {
+      font-size: 10px;
+      color: #a0aec0;
+      margin-top: 2px;
+      display: flex;
+      gap: 4px;
+      align-items: center;
+    }
+
+    .conv-item.active .conv-meta {
+      color: rgba(255, 255, 255, 0.75);
+    }
+
+    .conv-meta .dot {
+      opacity: 0.6;
+    }
+
     .conv-empty {
       padding: 12px;
       text-align: center;
@@ -267,6 +284,45 @@
       flex-direction: column;
       overflow: hidden;
       box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+    }
+
+    .chat-header {
+      border-bottom: 1px solid #e2e8f0;
+      padding: 14px 20px;
+      background: linear-gradient(135deg, #f8fafc 0%, #eef2ff 100%);
+    }
+
+    .chat-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #1a202c;
+      margin-bottom: 6px;
+    }
+
+    .chat-stats {
+      font-size: 12px;
+      color: #4a5568;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .chat-stats .stat {
+      background: #fff;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid #e2e8f0;
+    }
+
+    .chat-stats .stat-total {
+      background: #4f46e5;
+      color: #fff;
+      border-color: #4f46e5;
+    }
+
+    .chat-stats .stat-sep {
+      color: #a0aec0;
     }
 
     .messages {
@@ -497,6 +553,10 @@
       </aside>
 
       <section class="chat">
+        <div class="chat-header" id="chat-header">
+          <div class="chat-title" id="chat-title">💬 请在左侧选择或新建一个会话</div>
+          <div class="chat-stats" id="chat-stats"></div>
+        </div>
         <div class="messages" id="messages">
           <div class="empty">
             <div class="big">💬</div>
@@ -517,6 +577,8 @@
     const API_BASE = "http://localhost:8000";
     const $ = (id) => document.getElementById(id);
     const messagesEl = $("messages");
+    const chatTitleEl = $("chat-title");
+    const chatStatsEl = $("chat-stats");
     const inputEl = $("input");
     const sendBtn = $("send");
     const modeEl = $("mode");
@@ -553,8 +615,19 @@
       try {
         const res = await fetch(`${API_BASE}/conversations`);
         const data = await res.json();
-        conversations = data.conversations || [];
+        let convs = data.conversations || [];
+        // B1: 按 updated_at 倒序（最近活跃的会话在最上面）
+        convs.sort((a, b) => {
+          const ta = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+          const tb = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+          return tb - ta;
+        });
+        conversations = convs;
         renderConvList();
+        // 有活跃会话但没在上面分支里走 selectConversation 的，也要刷新 header
+        if (activeSessionId) {
+          renderChatHeader();
+        }
         // 如果当前没有活跃会话且存在会话，自动选第一个
         if (!activeSessionId && conversations.length > 0) {
           await selectConversation(conversations[0].session_id);
@@ -564,14 +637,37 @@
       }
     }
 
+    function formatTime(isoStr) {
+      if (!isoStr) return "";
+      const d = new Date(isoStr);
+      const now = new Date();
+      const diffHours = (now - d) / (1000 * 60 * 60);
+      if (diffHours < 24) {
+        return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+      }
+      if (diffHours < 24 * 7) {
+        return `${Math.floor(diffHours / 24)} 天前`;
+      }
+      return d.toLocaleDateString("zh-CN");
+    }
+
     function renderConvList() {
       if (!conversations.length) {
-        convListEl.innerHTML = `<div class="conv-empty">尚未有对话，点击"新建对话"开始 →</div>`;
+        convListEl.innerHTML = `
+          <div style="padding:18px 8px;color:#718096;font-size:12px;text-align:center;line-height:1.6">
+            <div style="font-size:24px;margin-bottom:6px">💬</div>
+            还没有会话<br>
+            点击上方 "新建对话" 开始<br>
+            <strong>← 点这里</strong>
+          </div>`;
         return;
       }
       convListEl.innerHTML = conversations.map((c) => {
         const isActive = c.session_id === activeSessionId;
         const preview = (c.preview || "（空对话）");
+        const msgCount = c.message_count || 0;
+        const totalTokens = c.total_tokens || 0;
+        const timeStr = formatTime(c.updated_at);
         return `
           <div class="conv-item ${isActive ? "active" : ""}" data-sid="${escapeAttr(c.session_id)}">
             <div class="conv-title">
@@ -582,6 +678,13 @@
               </span>
             </div>
             <div class="conv-preview">${escapeHtml(preview)}</div>
+            <div class="conv-meta">
+              <span>${msgCount} 条消息</span>
+              <span class="dot">·</span>
+              <span>${totalTokens} tokens</span>
+              <span class="dot">·</span>
+              <span>${timeStr || "刚刚"}</span>
+            </div>
           </div>
         `;
       }).join("");
@@ -723,7 +826,36 @@
       return localMessagesBySession[activeSessionId];
     }
 
+    function renderChatHeader() {
+      if (!activeSessionId) {
+        chatTitleEl.textContent = "💬 请在左侧选择或新建一个会话";
+        chatStatsEl.innerHTML = "";
+        return;
+      }
+      const current = conversations.find((c) => c.session_id === activeSessionId);
+      if (!current) {
+        chatTitleEl.textContent = "💬 对话中...";
+        chatStatsEl.innerHTML = "";
+        return;
+      }
+      chatTitleEl.innerHTML = `💬 ${escapeHtml(current.title || "未命名对话")}`;
+      const msgCount = current.message_count || 0;
+      const pt = current.prompt_tokens || 0;
+      const ct = current.completion_tokens || 0;
+      const total = (current.total_tokens) || (pt + ct);
+      chatStatsEl.innerHTML = `
+        <span class="stat">${msgCount} 条消息</span>
+        <span class="stat-sep">·</span>
+        <span class="stat">prompt ${pt}</span>
+        <span class="stat-sep">·</span>
+        <span class="stat">回复 ${ct}</span>
+        <span class="stat-sep">·</span>
+        <span class="stat stat-total">合计 ${total} tokens</span>
+      `;
+    }
+
     function renderMessages() {
+      renderChatHeader();
       const msgs = currentMessages();
       if (!activeSessionId || !msgs) {
         messagesEl.innerHTML = `
