@@ -1,16 +1,17 @@
-"""AgentRuntime：在 ChatRuntime 之上加 Planner → Tool → 回答 的决策循环。
+"""AgentRuntime：Planner → Tool → 回答 的决策循环。
 
 架构位置：
     Browser → FastAPI → AgentRuntime → ChatRuntime → ...
 
 执行流程（每次请求）：
-1. Planner 分析用户输入 → 判断是否调用工具
-2. 如果要调用工具：执行工具 → 把"工具调用 + 工具结果"作为额外上下文消息
-3. 调 ChatRuntime（它负责拼完整 Prompt、存历史、流式输出）
+1. Planner 看完整上下文（用户消息 + 已追加的工具结果）→ 判断是否调用工具
+2. 如果要调用工具：执行工具，把工具结果用 role=user + XML 标记追加
+3. 不需要工具时：调 ChatRuntime 生成最终回答
 
-设计要点：
-- 流模式：把 Planner/Tool 阶段以事件形式 yield 出去；然后直接迭代 chat_stream 的 token
-- 非流模式：正常走 Planner → Tool → ChatRuntime.chat
+消息格式设计原则（避免 role=tool 的 tool_call_id 问题）：
+- 工具结果 = role=user + XML 标记 `<tool_result tool="...">...</tool_result>`
+- 工具意图 = role=assistant + 简短自然语言声明
+- 这样 LLM 不需要理解原生 function calling 协议
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import time
 from typing import AsyncGenerator, List, Optional
 
 from src.ai_agent.core.chat_runtime import ChatRuntime
+from src.ai_agent.core.event import Event, EventBus
 from src.ai_agent.core.planner import Planner, PlannerDecision
 from src.ai_agent.core.stream import StreamItem
 from src.ai_agent.models.chat import ChatMessage
@@ -32,89 +34,151 @@ class AgentRuntime:
         chat_runtime: ChatRuntime,
         planner: Planner,
         tool_registry: Optional[ToolRegistry] = None,
+        bus: Optional[EventBus] = None,
         max_iterations: int = 5,
     ) -> None:
         self.chat = chat_runtime
         self.planner = planner
         self.registry = tool_registry or ToolRegistry()
+        self.bus = bus
         self.max_iterations = max_iterations
 
-    # ---------- 非流式 ----------
+    # ---------- 内部：发事件（安全：没有 bus 也不炸） ----------
+
+    def _emit(self, name: str, payload: dict) -> None:
+        if self.bus is not None:
+            self.bus.emit(Event(name=name, payload=payload))
+
+    # ---------- 公共：非流式 ----------
 
     async def run(
         self,
         session_id: Optional[str],
         user_messages: List[ChatMessage],
     ) -> str:
-        """走 Planner → Tool → ChatRuntime 的完整流程。非流式。"""
+        """走完整 Agent 流程。工具调用过程会走 EventBus（如果传了 bus）。"""
         extra_messages: List[ChatMessage] = []
         iteration = 0
 
         while iteration < self.max_iterations:
             iteration += 1
-            decision = await self.planner.plan(list(user_messages) + extra_messages)
 
+            # 步骤 A：Planner 决策
+            self._emit(
+                "agent.planning",
+                {
+                    "iteration": iteration,
+                    "session_id": session_id,
+                    "available_tools": [t.name for t in self.registry.all()],
+                },
+            )
+
+            decision: PlannerDecision = await self.planner.plan(
+                list(user_messages) + extra_messages
+            )
+
+            # 步骤 B：不需要工具 → 结束决策循环
             if not decision.use_tool:
+                self._emit(
+                    "agent.decision",
+                    {
+                        "session_id": session_id,
+                        "use_tool": False,
+                        "reason": decision.reason,
+                    },
+                )
                 break
 
             tool = self.registry.get(decision.tool or "")
             if tool is None:
-                extra_messages.append(
-                    ChatMessage(
-                        role="assistant",
-                        content=f"[Agent：尝试调用未知工具 {decision.tool!r}，跳过]",
-                    )
+                self._emit(
+                    "agent.error",
+                    {
+                        "session_id": session_id,
+                        "message": f"Planner 选择了不存在的工具：{decision.tool!r}",
+                    },
                 )
                 break
+
+            # 步骤 C：调用工具
+            self._emit(
+                "agent.tool_call",
+                {
+                    "session_id": session_id,
+                    "tool": decision.tool,
+                    "args": decision.args,
+                    "reason": decision.reason,
+                },
+            )
 
             try:
                 result = tool.run(decision.args or {})
             except Exception as e:
                 result = f"调用工具时出错：{type(e).__name__}: {e}"
+                self._emit(
+                    "agent.tool_error",
+                    {"session_id": session_id, "message": str(result)},
+                )
 
+            self._emit(
+                "agent.tool_result",
+                {
+                    "session_id": session_id,
+                    "tool": decision.tool,
+                    "result": str(result),
+                },
+            )
+
+            # 工具意图声明（assistant，让对话更自然）
             extra_messages.append(
                 ChatMessage(
                     role="assistant",
                     content=(
-                        f"[Agent：调用 {decision.tool}，"
-                        f"参数 {json.dumps(decision.args, ensure_ascii=False)}，"
-                        f"原因：{decision.reason}]"
+                        f"好的，我来调用 {decision.tool} 工具。"
+                        f"（参数：{json.dumps(decision.args, ensure_ascii=False)}）"
                     ),
                 )
             )
+
+            # 工具结果（role=user + XML 标记，让 LLM 明确知道这是外部输入）
             extra_messages.append(
                 ChatMessage(
-                    role="tool",
-                    content=f"工具 {decision.tool} 返回：{result}",
-                    name=decision.tool,
+                    role="user",
+                    content=(
+                        f'<tool_result tool="{decision.tool}">{result}</tool_result>'
+                    ),
                 )
             )
 
+        # 生成最终回答
         final_messages = list(user_messages) + extra_messages
         return await self.chat.chat(session_id, final_messages)
 
-    # ---------- 流式 ----------
+    # ---------- 公共：流式 ----------
 
     async def run_stream(
         self,
         session_id: Optional[str],
         user_messages: List[ChatMessage],
     ) -> AsyncGenerator[StreamItem, None]:
-        """流式版本。Planner/工具调用以 event 形式 yield。"""
+        """流式版本。Planner/工具调用阶段以 event 形式推给前端，同时发到 EventBus。"""
         extra_messages: List[ChatMessage] = []
         iteration = 0
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            # Step 1: 正在规划
+            # 步骤 A：Planner 决策（yield + emit）
+            event_payload = {
+                "iteration": iteration,
+                "session_id": session_id,
+                "available_tools": [t.name for t in self.registry.all()],
+            }
+            self._emit("agent.planning", event_payload)
             yield StreamItem(
                 kind="event",
                 event_name="agent.planning",
-                event_payload={
-                    "iteration": iteration,
-                    "available_tools": [t.name for t in self.registry.all()],
-                },
+                event_payload=event_payload,
                 created_at=time.time(),
             )
 
@@ -122,80 +186,96 @@ class AgentRuntime:
                 list(user_messages) + extra_messages
             )
 
-            # Step 2: 不需要工具 → 结束循环
+            self._emit("agent.planning.decision", decision.to_json())
+
+            # 步骤 B：不需要工具 → 结束决策循环
             if not decision.use_tool:
+                decision_payload = {
+                    "session_id": session_id,
+                    "use_tool": False,
+                    "reason": decision.reason,
+                }
+                self._emit("agent.decision", decision_payload)
                 yield StreamItem(
                     kind="event",
                     event_name="agent.decision",
-                    event_payload={
-                        "use_tool": False,
-                        "reason": decision.reason,
-                    },
+                    event_payload=decision_payload,
                     created_at=time.time(),
                 )
                 break
 
             tool = self.registry.get(decision.tool or "")
             if tool is None:
+                err_payload = {
+                    "session_id": session_id,
+                    "message": f"Planner 选择了不存在的工具：{decision.tool!r}",
+                }
+                self._emit("agent.error", err_payload)
                 yield StreamItem(
                     kind="event",
                     event_name="agent.error",
-                    event_payload={
-                        "message": f"Planner 选择了不存在的工具：{decision.tool!r}"
-                    },
+                    event_payload=err_payload,
                     created_at=time.time(),
                 )
                 break
 
+            # 步骤 C：调用工具（yield + emit）
+            tool_call_payload = {
+                "session_id": session_id,
+                "tool": decision.tool,
+                "args": decision.args,
+                "reason": decision.reason,
+            }
+            self._emit("agent.tool_call", tool_call_payload)
             yield StreamItem(
                 kind="event",
                 event_name="agent.tool_call",
-                event_payload={
-                    "tool": decision.tool,
-                    "args": decision.args,
-                    "reason": decision.reason,
-                },
+                event_payload=tool_call_payload,
                 created_at=time.time(),
             )
 
-            # Step 3: 执行工具
             try:
                 result = tool.run(decision.args or {})
             except Exception as e:
                 result = f"调用工具时出错：{type(e).__name__}: {e}"
-                yield StreamItem(
-                    kind="event",
-                    event_name="agent.tool_error",
-                    event_payload={"message": str(result)},
-                    created_at=time.time(),
-                )
+                err_payload = {"session_id": session_id, "message": str(result)}
+                self._emit("agent.tool_error", err_payload)
 
+            tool_result_payload = {
+                "session_id": session_id,
+                "tool": decision.tool,
+                "result": str(result),
+            }
+            self._emit("agent.tool_result", tool_result_payload)
             yield StreamItem(
                 kind="event",
                 event_name="agent.tool_result",
-                event_payload={"tool": decision.tool, "result": str(result)},
+                event_payload=tool_result_payload,
                 created_at=time.time(),
             )
 
+            # 声明工具意图 → 追加到消息序列
             extra_messages.append(
                 ChatMessage(
                     role="assistant",
                     content=(
-                        f"[Agent：调用 {decision.tool}，"
-                        f"参数 {json.dumps(decision.args, ensure_ascii=False)}，"
-                        f"原因：{decision.reason}]"
+                        f"好的，我来调用 {decision.tool} 工具。"
+                        f"（参数：{json.dumps(decision.args, ensure_ascii=False)}）"
                     ),
                 )
             )
+
+            # 工具结果 → 追加到消息序列
             extra_messages.append(
                 ChatMessage(
-                    role="tool",
-                    content=f"工具 {decision.tool} 返回：{result}",
-                    name=decision.tool,
+                    role="user",
+                    content=(
+                        f'<tool_result tool="{decision.tool}">{result}</tool_result>'
+                    ),
                 )
             )
 
-        # Step 4: 调 ChatRuntime 生成最终回答（流式）
+        # 生成最终回答（流式）
         final_messages = list(user_messages) + extra_messages
         async for item in self.chat.chat_stream(session_id, final_messages):
             yield item

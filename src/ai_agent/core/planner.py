@@ -22,7 +22,6 @@ from src.ai_agent.llm.base import BaseLLM
 from src.ai_agent.models.chat import ChatMessage
 from src.ai_agent.tools.base import ToolRegistry
 
-
 _PLANNER_SYSTEM_PROMPT = """你是一个**工具选择器**（Tool Selector）。
 
 你的任务：只分析用户的最新输入，判断是否需要调用外部工具来获取准确答案。
@@ -74,7 +73,9 @@ class PlannerDecision:
     def from_json(cls, data: Dict[str, Any], raw: str = "") -> "PlannerDecision":
         use_tool = bool(data.get("use_tool", False))
         if not use_tool:
-            return cls(use_tool=False, reason=str(data.get("reason", "")), raw_response=raw)
+            return cls(
+                use_tool=False, reason=str(data.get("reason", "")), raw_response=raw
+            )
         return cls(
             use_tool=True,
             tool=str(data.get("tool") or ""),
@@ -82,6 +83,14 @@ class PlannerDecision:
             reason=str(data.get("reason", "")),
             raw_response=raw,
         )
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "use_tool": self.use_tool,
+            "tool": self.tool,
+            "args": self.args,
+            "reason": self.reason,
+        }
 
 
 class Planner:
@@ -116,25 +125,23 @@ class Planner:
         return None
 
     async def plan(self, user_messages: List[ChatMessage]) -> PlannerDecision:
-        """对用户问题做决策。"""
+        """对用户问题做决策。注意：看完整上下文（用户消息 + 之前的工具结果），不只看最后一条。"""
         # 没有工具就直接返回
         if len(self.registry) == 0:
             return PlannerDecision.no_tool("没有注册任何工具")
 
-        # 用用户最后一条消息作为输入（用户可能连发多条，这里取最后一条）
-        last_msg = (
-            user_messages[-1].content if user_messages else ""
-        )
-        if not last_msg.strip():
+        if not user_messages:
             return PlannerDecision.no_tool("空输入")
 
         tools_description = self.registry.to_description_text()
         system_text = _PLANNER_SYSTEM_PROMPT.format(tools_description=tools_description)
 
-        planner_messages = [
-            ChatMessage(role="system", content=system_text),
-            ChatMessage(role="user", content=last_msg),
+        # 把完整上下文转给 Planner（用户消息 + 已产生的工具结果消息）
+        # 这样 Planner 可以理解多轮对话（如：用户先问数学，再追问"再算一个"）
+        planner_messages: List[ChatMessage] = [
+            ChatMessage(role="system", content=system_text)
         ]
+        planner_messages.extend(user_messages)
 
         try:
             resp = await self.llm.chat(planner_messages)
@@ -168,7 +175,9 @@ class Planner:
         if decision.use_tool:
             if not decision.tool:
                 return PlannerDecision(
-                    use_tool=False, reason="Planner 返回了 use_tool=true 但没写 tool 名", raw_response=raw
+                    use_tool=False,
+                    reason="Planner 返回了 use_tool=true 但没写 tool 名",
+                    raw_response=raw,
                 )
             if self.registry.get(decision.tool) is None:
                 return PlannerDecision(

@@ -62,6 +62,7 @@ def build_app_state(
         chat_runtime=chat_runtime,
         planner=planner,
         tool_registry=tool_registry,
+        bus=bus,
         max_iterations=_max_agent_iterations,
     )
     return AppState(
