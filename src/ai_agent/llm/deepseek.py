@@ -1,17 +1,20 @@
-from typing import AsyncGenerator, List, cast
+from typing import Any, AsyncGenerator, Dict, List, Optional, cast
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
-from src.ai_agent.config import LLMConfig
-from src.ai_agent.llm.base import BaseLLM
-from src.ai_agent.models.chat import (
+from ai_agent.config import LLMConfig
+from ai_agent.llm.base import BaseLLM
+from ai_agent.models.chat import (
     ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
     ChatCompletionResponse,
     ChatMessage,
+    FunctionCall,
+    ToolCall,
 )
+from ai_agent.tools.base import BaseTool
 
 _VALID_ROLES = {"system", "user", "assistant", "tool", "developer"}
 
@@ -42,7 +45,11 @@ class DeepSeekLLM(BaseLLM):
             # DeepSeek/OpenAI 的 tool role 是原生 function calling 配套设施，
             # 我们的 Planner 用的是 LLM 文本决策，天然没有 tool_calls 链。
             if msg.role == "tool" and not msg.tool_call_id:
-                prefix = f"[工具 {msg.name or 'unknown'} 结果] " if msg.name else "[工具结果] "
+                prefix = (
+                    f"[工具 {msg.name or 'unknown'} 结果] "
+                    if msg.name
+                    else "[工具结果] "
+                )
                 base_item = {"role": "assistant", "content": prefix + msg.content}
             else:
                 base_item = {"role": msg.role, "content": msg.content}
@@ -54,12 +61,45 @@ class DeepSeekLLM(BaseLLM):
             result.append(item)
         return result
 
-    async def chat(self, messages: List[ChatMessage]) -> ChatCompletionResponse:
+    @staticmethod
+    def _format_tool_schema(tool: BaseTool) -> Dict[str, Any]:
+        """把通用 BaseTool 转成 DeepSeek/OpenAI function calling 需要的 schema。
+
+        这个格式化逻辑是 DeepSeek 协议特定的，因此**内聚在 DeepSeekLLM 里**，
+        不放在 BaseTool 基类中。
+
+        输出格式：
+        {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "description": "执行数学计算",
+                "parameters": {...}
+            }
+        }
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.args_schema,
+            },
+        }
+
+    async def chat(
+        self,
+        messages: List[ChatMessage],
+        temperature: Optional[float] = None,
+    ) -> ChatCompletionResponse:
         formatted_messages = self.format_messages(messages)
+        effective_temperature = (
+            self.config.temperature if temperature is None else temperature
+        )
         response = await self.client.chat.completions.create(
             model=self.config.model,
             messages=formatted_messages,
-            temperature=self.config.temperature,
+            temperature=effective_temperature,
             max_tokens=self.config.max_tokens,
             stream=False,
         )
@@ -72,6 +112,73 @@ class DeepSeekLLM(BaseLLM):
                     message=ChatMessage(
                         role=choice.message.role, content=choice.message.content or ""
                     ),
+                    finish_reason=choice.finish_reason,
+                )
+            )
+
+        return ChatCompletionResponse(
+            id=response.id,
+            object=response.object,
+            created=response.created,
+            model=response.model,
+            choices=choices,
+        )
+
+    async def chat_with_tools(
+        self,
+        messages: List[ChatMessage],
+        tools: List[BaseTool],
+        tool_choice: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> ChatCompletionResponse:
+        """扩展能力：走原生 function calling 调用。
+
+        这是 DeepSeekLLM 的**特定能力**，不属于 BaseLLM 的通用接口。
+        Planner 会检测有没有这个方法，有就走原生、没有就降级到 Prompt JSON。
+
+        这里故意接收 List[BaseTool]，由** DeepSeekLLM 自己**把通用工具描述转成
+        OpenAI function calling 要求的 schema 格式（内聚原则），避免 BaseTool
+        被特定协议污染。
+        """
+        formatted_messages = self.format_messages(messages)
+        effective_temperature = (
+            self.config.temperature if temperature is None else temperature
+        )
+
+        tools_schema = [self._format_tool_schema(t) for t in tools]
+        kwargs: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": formatted_messages,
+            "temperature": effective_temperature,
+            "max_tokens": self.config.max_tokens,
+            "stream": False,
+            "tools": tools_schema,
+        }
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
+        response = await self.client.chat.completions.create(**kwargs)
+
+        choices = []
+        for choice in response.choices:
+            msg = choice.message
+            our_message = ChatMessage(role=msg.role, content=msg.content or "")
+            if msg.tool_calls:
+                our_message.tool_calls = [
+                    ToolCall(
+                        id=tc.id,
+                        type=tc.type,
+                        function=FunctionCall(
+                            name=tc.function.name,
+                            arguments=tc.function.arguments,
+                        ),
+                    )
+                    for tc in msg.tool_calls
+                ]
+            choices.append(
+                ChatCompletionChoice(
+                    index=choice.index,
+                    message=our_message,
                     finish_reason=choice.finish_reason,
                 )
             )

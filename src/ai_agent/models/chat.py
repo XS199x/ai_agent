@@ -1,6 +1,17 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
+
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: FunctionCall
 
 
 class ChatMessage(BaseModel):
@@ -8,6 +19,10 @@ class ChatMessage(BaseModel):
     content: str
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+
+    def has_tool_call(self) -> bool:
+        return bool(self.tool_calls)
 
 
 class ChatCompletionChoice(BaseModel):

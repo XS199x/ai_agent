@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional
 
-from src.ai_agent.config import LLMConfig
-from src.ai_agent.models.chat import (
+from ai_agent.config import LLMConfig
+from ai_agent.models.chat import (
     ChatCompletionChunk,
     ChatCompletionResponse,
     ChatMessage,
@@ -13,7 +13,11 @@ class BaseLLM(ABC):
     config: LLMConfig
 
     @abstractmethod
-    async def chat(self, messages: List[ChatMessage]) -> ChatCompletionResponse:
+    async def chat(
+        self,
+        messages: List[ChatMessage],
+        temperature: Optional[float] = None,
+    ) -> ChatCompletionResponse:
         pass
 
     @abstractmethod

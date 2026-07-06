@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from src.ai_agent.core.event import Event, EventBus
+from ai_agent.core.event import Event, EventBus
 
 # ---------------------------------------------------------------------------
 # StreamItem：流中的一个元素
@@ -126,6 +126,9 @@ class StreamHandle:
         self._full_text: str = ""
         self._token_count: int = 0
         self._has_produced: bool = False
+        self._start_time: float = 0.0
+        self._success: bool = False
+        self._error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # 状态访问
@@ -141,6 +144,18 @@ class StreamHandle:
     @property
     def done(self) -> bool:
         return self._done
+
+    @property
+    def start_time(self) -> float:
+        return self._start_time
+
+    @property
+    def success(self) -> bool:
+        return self._success
+
+    @property
+    def error(self) -> Optional[str]:
+        return self._error
 
     # ------------------------------------------------------------------
     # 生产者接口

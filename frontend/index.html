@@ -525,23 +525,8 @@
         </div>
 
         <div>
-          <label>对话模式</label>
-          <select id="mode">
-            <option value="/chat">普通聊天</option>
-            <option value="/agent/chat">Agent 模式（推理+工具）</option>
-          </select>
-        </div>
-
-        <div>
           <label>系统提示词（当前会话）</label>
           <textarea id="system-prompt" placeholder="设置 AI 的人设和行为规则"></textarea>
-        </div>
-
-        <div>
-          <label>
-            <input type="checkbox" id="stream" checked />
-            启用流式输出（打字机效果）
-          </label>
         </div>
 
         <div class="row">
@@ -561,7 +546,7 @@
           <div class="empty">
             <div class="big">💬</div>
             <h3>开始对话</h3>
-            <p>在下方输入问题，AI 会用流式输出实时回复你。</p>
+            <p>在下方输入问题，AI 会调用工具并用流式输出实时回复你。</p>
           </div>
         </div>
 
@@ -581,9 +566,8 @@
     const chatStatsEl = $("chat-stats");
     const inputEl = $("input");
     const sendBtn = $("send");
-    const modeEl = $("mode");
+    const modeEl = null;
     const systemPromptEl = $("system-prompt");
-    const streamEl = $("stream");
     const healthEl = $("health");
     const convListEl = $("conv-list");
 
@@ -943,17 +927,15 @@
       sendBtn.disabled = true;
       sendBtn.textContent = "思考中...";
 
-      const useStream = streamEl.checked;
       // 本次只发送最新的用户消息，历史由后端自动拼接
       const body = {
         messages: [{ role: "user", content: text }],
-        stream: useStream,
         session_id: activeSessionId,
       };
 
       const info = document.createElement("div");
       info.className = "request-info";
-      info.textContent = `POST ${API_BASE}${modeEl.value} · session=${activeSessionId.slice(0, 8)} (${useStream ? "stream" : "non-stream"})`;
+      info.textContent = `POST ${API_BASE}/agent/chat · session=${activeSessionId.slice(0, 8)} (stream)`;
       messagesEl.appendChild(info);
       messagesEl.scrollTop = messagesEl.scrollHeight;
 
@@ -962,7 +944,7 @@
 
       let fullText = "";
       try {
-        const res = await fetch(API_BASE + modeEl.value, {
+        const res = await fetch(API_BASE + "/agent/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -973,54 +955,43 @@
           throw new Error(`HTTP ${res.status}: ${errText}`);
         }
 
-        if (useStream) {
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder("utf-8");
-          let buffer = "";
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
 
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
 
-            let idx;
-            while ((idx = buffer.indexOf("\n")) !== -1) {
-              const line = buffer.slice(0, idx).trim();
-              buffer = buffer.slice(idx + 1);
+          let idx;
+          while ((idx = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
 
-              if (!line.startsWith("data:")) continue;
-              const dataText = line.slice(5).trim();
-              if (!dataText) continue;
+            if (!line.startsWith("data:")) continue;
+            const dataText = line.slice(5).trim();
+            if (!dataText) continue;
 
-              try {
-                const chunk = JSON.parse(dataText);
-                const choices = chunk.choices || [];
-                if (choices.length > 0) {
-                  const delta = choices[0].delta || choices[0].message || {};
-                  const piece = delta.content || "";
-                  if (piece) {
-                    fullText += piece;
-                    if (bubbleEl) bubbleEl.innerHTML = escapeHtml(fullText) + '<span class="cursor"></span>';
-                    messagesEl.scrollTop = messagesEl.scrollHeight;
-                  }
+            try {
+              const chunk = JSON.parse(dataText);
+              const choices = chunk.choices || [];
+              if (choices.length > 0) {
+                const delta = choices[0].delta || choices[0].message || {};
+                const piece = delta.content || "";
+                if (piece) {
+                  fullText += piece;
+                  if (bubbleEl) bubbleEl.innerHTML = escapeHtml(fullText) + '<span class="cursor"></span>';
+                  messagesEl.scrollTop = messagesEl.scrollHeight;
                 }
-              } catch (_) { }
-            }
+              }
+            } catch (_) { }
           }
-          if (bubbleEl) bubbleEl.textContent = fullText || "(无内容)";
-          // 更新本地消息
-          const msgs = currentMessages();
-          if (msgs && msgs.length > 0) msgs[msgs.length - 1].content = fullText;
-        } else {
-          const data = await res.json();
-          const choices = data.choices || [];
-          if (choices.length > 0) {
-            fullText = (choices[0].message && choices[0].message.content) || "(无内容)";
-          }
-          if (bubbleEl) bubbleEl.textContent = fullText;
-          const msgs = currentMessages();
-          if (msgs && msgs.length > 0) msgs[msgs.length - 1].content = fullText;
         }
+        if (bubbleEl) bubbleEl.textContent = fullText || "(无内容)";
+        // 更新本地消息
+        const msgs = currentMessages();
+        if (msgs && msgs.length > 0) msgs[msgs.length - 1].content = fullText;
 
         // 刷新列表以更新预览/标题
         fetchConversations();

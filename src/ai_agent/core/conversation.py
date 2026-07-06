@@ -7,7 +7,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Dict, List, Optional
 
-from src.ai_agent.models.chat import ChatMessage
+from ai_agent.models.chat import ChatMessage
 
 
 SCHEMA = """

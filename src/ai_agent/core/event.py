@@ -103,16 +103,100 @@ class EventBus:
 
 
 class PrintLogHandler:
-    """最朴素的日志：直接打印事件到 stdout。llm.token 事件太频繁，默认跳过。"""
+    """Phase 2 升级版：带时间戳、分等级、更紧凑美观。
 
-    def __init__(self, skip_tokens: bool = True, prefix: str = "[event]") -> None:
+    输出格式：
+        [HH:MM:SS] ⚡ agent.planning          iteration=1 available_tools=3
+        [HH:MM:SS] ✓ agent.tool_call          tool=calculator
+        [HH:MM:SS] ✓ agent.tool_result        tool=calculator duration_ms=0
+        [HH:MM:SS] → chat.prompt_stats        prompt_tokens=42
+
+    工具调用用 ✓ / ✗ 标识成功/失败；纯信息类用 →；Planner 用 ⚡。
+    """
+
+    # 事件名 → ASCII 图标（避免 Windows gbk 终端编码问题）
+    _ICON_MAP = {
+        "agent.planning": "* ",
+        "agent.planning.decision": "= ",
+        "agent.decision": "> ",
+        "agent.tool_call": "-> ",
+        "agent.tool_result": "OK ",
+        "agent.tool_error": "!! ",
+        "agent.error": "!! ",
+        "chat.prompt_stats": "-> ",
+        "llm.start": ". ",
+        "llm.done": "OK ",
+    }
+
+    def __init__(self, skip_tokens: bool = True) -> None:
         self.skip_tokens = skip_tokens
-        self.prefix = prefix
+
+    @staticmethod
+    def _format_payload(payload: dict) -> str:
+        """把 payload dict 变成 key=value 紧凑形式。"""
+        if not payload:
+            return ""
+        parts = []
+        for k, v in payload.items():
+            if isinstance(v, (int, float)):
+                parts.append(f"{k}={v}")
+            elif isinstance(v, list):
+                parts.append(f"{k}=[{', '.join(str(x) for x in v[:10])}]")
+            else:
+                s = str(v)
+                if len(s) > 40:
+                    s = s[:37] + "..."
+                parts.append(f"{k}={s}")
+        return "  ".join(parts)
 
     def __call__(self, event: Event) -> None:
         if self.skip_tokens and event.name == "llm.token":
             return
-        print(f"{self.prefix} {event.name} payload={event.payload}")
+        ts = datetime.fromtimestamp(event.timestamp).strftime("%H:%M:%S")
+        icon = self._ICON_MAP.get(event.name, "• ")
+        payload_text = self._format_payload(event.payload)
+        # 左对齐事件名，固定宽度 28，方便对齐
+        print(f"[{ts}] {icon} {event.name:<28}{payload_text}")
+
+
+class StructuredLogHandler:
+    """Phase 2 新增：结构化 JSON 日志，一行一个事件，方便 grep/分析。
+
+    输出示例（一行）：
+        {"ts": "2026-07-02T17:30:00", "level": "info", "name": "agent.tool_result",
+         "payload": {"tool": "calculator", "success": true, "duration_ms": 0}}
+    """
+
+    # 事件名 → 日志级别
+    _LEVEL_MAP = {
+        "agent.error": "error",
+        "agent.tool_error": "error",
+        "llm.done": "info",
+        "chat.prompt_stats": "info",
+        "agent.planning.decision": "info",
+    }
+
+    def __init__(
+        self,
+        skip_tokens: bool = True,
+        indent: bool = False,
+    ) -> None:
+        self.skip_tokens = skip_tokens
+        self.indent = indent
+
+    def __call__(self, event: Event) -> None:
+        if self.skip_tokens and event.name == "llm.token":
+            return
+        line = {
+            "ts": datetime.fromtimestamp(event.timestamp).isoformat(timespec="seconds"),
+            "level": self._LEVEL_MAP.get(event.name, "info"),
+            "name": event.name,
+            "payload": event.payload,
+        }
+        if self.indent:
+            print(json.dumps(line, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(line, ensure_ascii=False))
 
 
 class FileLogHandler:

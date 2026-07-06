@@ -15,10 +15,15 @@ dependencies = [
 ]
 
 [project.scripts]
-start = "src.main:main"
+start = "ai_agent.main:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# hatchling 自动识别 src/ 目录为包根（src-layout 是默认支持的）
+# Python 包在 src/ai_agent/ 下
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_agent"]
 
 [build-system]
 requires = ["hatchling"]

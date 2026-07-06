@@ -1,24 +1,38 @@
+"""FastAPI 应用入口。
+
+使用新架构：
+- AgentLoop（核心循环）
+- LLMPlanner（决策层）
+- ToolExecutor（执行层）
+- LocalToolProvider（工具提供者）
+- SimpleContextProvider（上下文提供者）
+- DefaultPromptBuilder（提示词构建）
+"""
+
 from contextlib import asynccontextmanager
 from pathlib import Path
-from time import time
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from src.ai_agent.core.agent_runtime import AgentRuntime
-from src.ai_agent.core.chat_runtime import ChatRuntime
-from src.ai_agent.core.conversation import Conversation, ConversationStore
-from src.ai_agent.core.event import EventBus, get_default_bus
-from src.ai_agent.core.planner import Planner
-from src.ai_agent.core.stream import item_to_sse_line
-from src.ai_agent.llm.base import BaseLLM
-from src.ai_agent.llm.factory import create_llm
-from src.ai_agent.models.chat import ChatMessage
-from src.ai_agent.tools.base import ToolRegistry
-from src.ai_agent.tools.calculator import CalculatorTool
+from ai_agent.core.agent_loop import AgentLoop
+from ai_agent.core.application_profile import ApplicationProfile
+from ai_agent.core.context_provider import SimpleContextProvider
+from ai_agent.core.conversation import Conversation, ConversationStore
+from ai_agent.core.event import EventBus, get_default_bus
+from ai_agent.core.executor import ToolExecutor
+from ai_agent.core.planner import LLMPlanner
+from ai_agent.core.stream import item_to_sse_line
+from ai_agent.llm.base import BaseLLM
+from ai_agent.llm.factory import create_llm
+from ai_agent.tools.base import ToolRegistry
+from ai_agent.tools.calculator import CalculatorTool
+from ai_agent.tools.datetime_tool import DateTimeTool
+from ai_agent.tools.local_provider import LocalToolProvider
+from ai_agent.tools.text_stats_tool import TextStatsTool
 
 # ---------------------------------------------------------------------------
 # 路径 / 常量
@@ -30,6 +44,32 @@ _persist_path = _project_root / "data" / "conversations.db"
 _max_conversations = 100
 _max_agent_iterations = 5
 
+# ---------------------------------------------------------------------------
+# 应用定义（Application Profiles）
+#
+# ⬇ 这里是"做新应用"的唯一位置：加一个 Profile，框架自动把它跑起来。
+# ---------------------------------------------------------------------------
+
+
+def _default_profiles() -> Dict[str, ApplicationProfile]:
+    """默认注册一个 Agent 应用。
+
+    做一个新应用 = 在这个函数里加一行：
+        profiles["my_app"] = ApplicationProfile.agent_app(
+            name="my_app",
+            system_prompt="my_app",       # prompts/my_app.txt
+            tools=["calculator", "datetime"],
+        )
+    """
+    return {
+        "agent": ApplicationProfile.agent_app(
+            "agent",
+            system_prompt="agent_system",
+            tools=["calculator", "datetime", "text_stats"],
+            max_iterations=_max_agent_iterations,
+        ),
+    }
+
 
 # ---------------------------------------------------------------------------
 # 依赖构建（显式、可测试）
@@ -39,7 +79,11 @@ _max_agent_iterations = 5
 def build_tool_registry() -> ToolRegistry:
     """集中注册所有工具。加新工具时只改这里。"""
     registry = ToolRegistry()
+
     registry.register(CalculatorTool())
+    registry.register(DateTimeTool())
+    registry.register(TextStatsTool())
+
     return registry
 
 
@@ -48,36 +92,63 @@ def build_app_state(
     bus: Optional[EventBus] = None,
     store: Optional[ConversationStore] = None,
     tool_registry: Optional[ToolRegistry] = None,
+    profiles: Optional[Dict[str, ApplicationProfile]] = None,
 ) -> "AppState":
-    """构建完整的运行时依赖图。测试时可以传 mock。"""
+    """构建完整的运行时依赖图。
+
+    流程：
+      1. 创建基础基础设施（LLM / EventBus / ConversationStore / ToolRegistry）
+      2. 读取 Application Profiles —— 每个 Profile 描述一个 Agent 应用
+      3. 按 Profile 构造 AgentLoop
+
+    做一个新应用 → 新增 Application Profile；不用改这里的任何一行。
+    """
     bus = bus or get_default_bus()
     store = store or ConversationStore(
         max_conversations=_max_conversations, persist_path=_persist_path
     )
     llm = llm or create_llm()
     tool_registry = tool_registry or build_tool_registry()
-    chat_runtime = ChatRuntime(llm=llm, store=store, bus=bus)
-    planner = Planner(llm=llm, registry=tool_registry)
-    agent_runtime = AgentRuntime(
-        chat_runtime=chat_runtime,
-        planner=planner,
-        tool_registry=tool_registry,
-        bus=bus,
-        max_iterations=_max_agent_iterations,
-    )
+
+    profiles = profiles or _default_profiles()
+
+    agent_loops: Dict[str, AgentLoop] = {}
+
+    for profile in profiles.values():
+        system_prompt_text = profile.resolve_system_prompt()
+
+        # Agent 应用：构造 Planner + Executor + AgentLoop
+        resolved_tools = profile.resolve_tools(tool_registry)
+        local_registry = ToolRegistry()
+        for t in resolved_tools:
+            local_registry.register(t)
+        tool_provider = LocalToolProvider(local_registry)
+        tool_executor = ToolExecutor(tool_provider)
+        context_provider = SimpleContextProvider(tool_provider)
+        planner = LLMPlanner(
+            llm=llm,
+            tool_provider=tool_provider,
+            system_prompt=system_prompt_text,
+        )
+        agent_loops[profile.name] = AgentLoop(
+            planner=planner,
+            executor=tool_executor,
+            context_provider=context_provider,
+            llm=llm,
+        )
+
     return AppState(
         llm=llm,
         bus=bus,
         store=store,
         tool_registry=tool_registry,
-        chat_runtime=chat_runtime,
-        planner=planner,
-        agent_runtime=agent_runtime,
+        profiles=profiles,
+        agent_loops=agent_loops,
     )
 
 
 class AppState:
-    """所有应用级单例的容器，挂在 app.state 上。"""
+    """所有应用级单例的容器，挂在 app.state.ai 上。"""
 
     def __init__(
         self,
@@ -85,17 +156,26 @@ class AppState:
         bus: EventBus,
         store: ConversationStore,
         tool_registry: ToolRegistry,
-        chat_runtime: ChatRuntime,
-        planner: Planner,
-        agent_runtime: AgentRuntime,
+        profiles: Dict[str, ApplicationProfile],
+        agent_loops: Dict[str, AgentLoop],
     ) -> None:
         self.llm = llm
         self.bus = bus
         self.store = store
         self.tool_registry = tool_registry
-        self.chat_runtime = chat_runtime
-        self.planner = planner
-        self.agent_runtime = agent_runtime
+        self.profiles = profiles
+        self.agent_loops = agent_loops
+
+    @property
+    def agent_loop(self) -> AgentLoop:
+        if "agent" in self.agent_loops:
+            return self.agent_loops["agent"]
+        if not self.agent_loops:
+            raise RuntimeError(
+                "没有注册任何 Agent 模式的应用。请在 _default_profiles() 中添加"
+                "一个 ApplicationProfile.agent_app()。"
+            )
+        return next(iter(self.agent_loops.values()))
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +186,11 @@ class AppState:
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     state = build_app_state()
-    # 挂到 FastAPI 原生 state，测试时可以 override
     fastapi_app.state.ai = state
     yield
-    # 在这里加清理逻辑（比如关闭 DB、刷新日志文件等）
 
 
-app = FastAPI(title="AI Agent API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="AI Agent API", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -135,7 +213,6 @@ def state_of(request: Request) -> AppState:
 
 class ChatRequest(BaseModel):
     messages: list
-    stream: bool = True
     session_id: Optional[str] = None
 
 
@@ -273,44 +350,40 @@ async def get_conversation_stats(request: Request, session_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 聊天 API
+# Agent 聊天 API（唯一入口，永远流式）
 # ---------------------------------------------------------------------------
-
-
-@app.post("/chat")
-async def chat(request: Request, req: ChatRequest):
-    if not req.messages:
-        raise HTTPException(status_code=400, detail="Messages cannot be empty")
-
-    state = state_of(request)
-    user_messages = _coerce_messages(req.messages)
-
-    if req.stream:
-        return StreamingResponse(
-            _to_sse(state.chat_runtime.chat_stream(req.session_id, user_messages)),
-            media_type="text/event-stream",
-        )
-
-    text = await state.chat_runtime.chat(req.session_id, user_messages)
-    return _build_completion_response(text)
 
 
 @app.post("/agent/chat")
 async def agent_chat(request: Request, req: ChatRequest):
+    """Agent 对话。永远返回 SSE（text/event-stream）。"""
     if not req.messages:
         raise HTTPException(status_code=400, detail="Messages cannot be empty")
 
     state = state_of(request)
-    user_messages = _coerce_messages(req.messages)
 
-    if req.stream:
-        return StreamingResponse(
-            _to_sse(state.agent_runtime.run_stream(req.session_id, user_messages)),
-            media_type="text/event-stream",
-        )
+    last_user_message = None
+    for m in req.messages:
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user_message = m.get("content", "")
+        else:
+            last_user_message = str(m)
 
-    text = await state.agent_runtime.run(req.session_id, user_messages)
-    return _build_completion_response(text)
+    if not last_user_message:
+        raise HTTPException(status_code=400, detail="No user message found")
+
+    session = req.session_id or ""
+
+    return StreamingResponse(
+        _agent_sse(state, session, last_user_message),
+        media_type="text/event-stream",
+    )
+
+
+async def _agent_sse(state, session_id: str, user_input: str):
+    """把 AgentLoop.run_stream 转成 SSE 文本流。"""
+    async for sse_line in _to_sse(state.agent_loop.run_stream(session_id, user_input)):
+        yield sse_line
 
 
 # ---------------------------------------------------------------------------
@@ -324,43 +397,10 @@ async def _to_sse(stream):
         yield item_to_sse_line(item)
 
 
-def _coerce_messages(messages: list) -> list:
-    """把请求里的消息统一转成 ChatMessage（容错：dict/list/ChatMessage 都接受）。"""
-    out = []
-    for m in messages:
-        if isinstance(m, dict):
-            out.append(
-                ChatMessage(role=m.get("role", "user"), content=m.get("content", ""))
-            )
-        elif isinstance(m, ChatMessage):
-            out.append(m)
-        else:
-            out.append(ChatMessage(role="user", content=str(m)))
-    return out
-
-
-def _build_completion_response(text: str) -> dict:
-    """非流式返回的响应结构（和 OpenAI SDK 风格一致）。"""
-    return {
-        "id": "non-stream",
-        "object": "chat.completion",
-        "created": int(time()),
-        "model": "",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
-    }
-
-
 def _find_token_handler(bus: EventBus):
-    """从 bus 里找 TokenCountHandler（如果注册了的话）。"""
+    """从 bus 里找 TokenCountHandler。"""
     for h in getattr(bus, "_handlers", []):
-        # 延迟导入避免循环引用
-        from src.ai_agent.core.event import TokenCountHandler
+        from ai_agent.core.event import TokenCountHandler
 
         if isinstance(h, TokenCountHandler):
             return h

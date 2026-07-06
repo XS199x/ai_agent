@@ -1,8 +1,8 @@
 from typing import Literal
 
-from src.ai_agent.config import LLMConfig, config
-from src.ai_agent.llm.base import BaseLLM
-from src.ai_agent.llm.deepseek import DeepSeekLLM
+from ai_agent.config import LLMConfig, config
+from ai_agent.llm.base import BaseLLM
+from ai_agent.llm.deepseek import DeepSeekLLM
 
 ProviderType = Literal["deepseek"]
 
