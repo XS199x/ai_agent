@@ -24,6 +24,7 @@ from ai_agent.core.context_provider import SimpleContextProvider
 from ai_agent.core.conversation import Conversation, ConversationStore
 from ai_agent.core.event import EventBus, get_default_bus
 from ai_agent.core.executor import ToolExecutor
+from ai_agent.core.knowledge.file_knowledge_provider import FileKnowledgeProvider
 from ai_agent.core.planner import LLMPlanner
 from ai_agent.core.stream import item_to_sse_line
 from ai_agent.llm.base import BaseLLM
@@ -97,15 +98,23 @@ def build_app_state(
     """构建完整的运行时依赖图。
 
     流程：
-      1. 创建基础基础设施（LLM / EventBus / ConversationStore / ToolRegistry）
+      1. 创建基础基础设施（LLM / EventBus / KnowledgeProvider / ConversationStore / ToolRegistry）
       2. 读取 Application Profiles —— 每个 Profile 描述一个 Agent 应用
       3. 按 Profile 构造 AgentLoop
 
     做一个新应用 → 新增 Application Profile；不用改这里的任何一行。
     """
     bus = bus or get_default_bus()
+
+    knowledge_provider = FileKnowledgeProvider(_project_root / "data" / "knowledge")
+    import asyncio
+
+    asyncio.run(knowledge_provider.setup())
+
     store = store or ConversationStore(
-        max_conversations=_max_conversations, persist_path=_persist_path
+        max_conversations=_max_conversations,
+        persist_path=_persist_path,
+        knowledge_provider=knowledge_provider,
     )
     llm = llm or create_llm()
     tool_registry = tool_registry or build_tool_registry()
@@ -124,7 +133,7 @@ def build_app_state(
             local_registry.register(t)
         tool_provider = LocalToolProvider(local_registry)
         tool_executor = ToolExecutor(tool_provider)
-        context_provider = SimpleContextProvider(tool_provider)
+        context_provider = SimpleContextProvider(tool_provider, store)
         planner = LLMPlanner(
             llm=llm,
             tool_provider=tool_provider,
@@ -135,6 +144,7 @@ def build_app_state(
             executor=tool_executor,
             context_provider=context_provider,
             llm=llm,
+            bus=bus,
         )
 
     return AppState(

@@ -1,15 +1,19 @@
-"""SimpleContextProvider：用于测试的简单上下文提供者。
+"""SimpleContextProvider：基于 ConversationStore 的上下文提供者。
 
-提供基本的上下文构建能力，包含：
-- 会话消息
-- 可用工具（从 ToolProvider 获取）
-- 空的记忆和知识（后续可扩展）
+从 ConversationStore 获取会话历史，调用会话的知识检索方法，
+组装成 AgentContext 供 AgentLoop 使用。
+
+设计原则：
+1. 不自己维护状态，完全依赖 ConversationStore
+2. 知识检索通过 Conversation.retrieve_knowledge() 内部处理
+3. 对外只暴露 ContextProvider 接口
 """
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
+from ai_agent.core.conversation import ConversationStore
 from ai_agent.core.executor import ContextProvider, ToolProvider
 from ai_agent.models.action import Action
 from ai_agent.models.chat import ChatMessage
@@ -17,11 +21,15 @@ from ai_agent.models.context import AgentContext, MemorySnapshot, RuntimeState
 
 
 class SimpleContextProvider(ContextProvider):
-    """简单的上下文提供者。"""
+    """基于 ConversationStore 的上下文提供者。"""
 
-    def __init__(self, tool_provider: ToolProvider) -> None:
+    def __init__(
+        self,
+        tool_provider: ToolProvider,
+        conversation_store: Optional[ConversationStore] = None,
+    ) -> None:
         self._tool_provider = tool_provider
-        self._conversations: dict = {}
+        self._store = conversation_store
 
     async def setup(self) -> None:
         pass
@@ -33,15 +41,20 @@ class SimpleContextProvider(ContextProvider):
         return True
 
     async def get_context(self, session_id: str, user_input: str) -> AgentContext:
-        conversation = self._get_or_create_conversation(session_id)
-        conversation.append(ChatMessage(role="user", content=user_input))
+        conversation = await self._get_or_create_conversation(session_id)
+        user_msg = ChatMessage(role="user", content=user_input)
+
+        if self._store is not None:
+            self._store.append_message(session_id, user_msg)
+
+        knowledge = await conversation.retrieve_knowledge(user_input)
 
         available_actions = self._tool_provider.as_actions()
 
         return AgentContext(
-            conversation=conversation,
+            conversation=conversation.messages + [user_msg],
             memory=MemorySnapshot(),
-            knowledge=[],
+            knowledge=knowledge,
             available_actions=available_actions,
             runtime_state=RuntimeState(
                 session_id=session_id,
@@ -51,7 +64,13 @@ class SimpleContextProvider(ContextProvider):
             user_input=user_input,
         )
 
-    def _get_or_create_conversation(self, session_id: str) -> List[ChatMessage]:
-        if session_id not in self._conversations:
-            self._conversations[session_id] = []
-        return list(self._conversations[session_id])
+    async def _get_or_create_conversation(self, session_id: str) -> "Conversation":
+        if self._store is not None:
+            conv = self._store.get(session_id)
+            if conv is None:
+                conv = self._store.create()
+            return conv
+
+        from ai_agent.core.conversation import Conversation
+
+        return Conversation(session_id=session_id)

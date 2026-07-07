@@ -5,10 +5,10 @@ import time
 import uuid
 from pathlib import Path
 from threading import RLock
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+from ai_agent.core.executor import KnowledgeProvider
 from ai_agent.models.chat import ChatMessage
-
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -43,11 +43,13 @@ class Conversation:
         system_prompt: Optional[str] = None,
         created_at: Optional[int] = None,
         updated_at: Optional[int] = None,
+        knowledge_provider: Optional[KnowledgeProvider] = None,
     ) -> None:
         self.session_id: str = session_id or uuid.uuid4().hex
         self.title: str = title
         self.system_prompt: Optional[str] = system_prompt
         self.messages: List[ChatMessage] = []
+        self._knowledge_provider: Optional[KnowledgeProvider] = knowledge_provider
         now = int(time.time())
         self.created_at: int = created_at if created_at else now
         self.updated_at: int = updated_at if updated_at else now
@@ -67,6 +69,11 @@ class Conversation:
     def clear(self) -> None:
         self.messages = []
         self.updated_at = int(time.time())
+
+    async def retrieve_knowledge(self, query: str) -> List[Any]:
+        if self._knowledge_provider is None:
+            return []
+        return await self._knowledge_provider.retrieve(query, self.session_id)
 
     def to_dict(self) -> dict:
         return {
@@ -92,13 +99,13 @@ class ConversationStore:
         self,
         max_conversations: int = 100,
         persist_path: Optional[os.PathLike | str] = None,
+        knowledge_provider: Optional[KnowledgeProvider] = None,
     ) -> None:
+        self._knowledge_provider = knowledge_provider
         self._max = max_conversations
         self._lock = RLock()
         self._persist_path: Optional[Path] = (
-            Path(persist_path).expanduser().resolve()
-            if persist_path
-            else None
+            Path(persist_path).expanduser().resolve() if persist_path else None
         )
 
         # 内存索引：保证读取路径统一
@@ -139,6 +146,7 @@ class ConversationStore:
                 system_prompt=r["system_prompt"],
                 created_at=r["created_at"],
                 updated_at=r["updated_at"],
+                knowledge_provider=self._knowledge_provider,
             )
             mcur = self._conn.execute(
                 "SELECT role, content, extra_json FROM messages "
@@ -225,7 +233,12 @@ class ConversationStore:
                         self._conn.execute(
                             "INSERT INTO messages(session_id, role, content, created_at) "
                             "VALUES (?, ?, ?, ?)",
-                            (sid, m.get("role", "user"), m.get("content", ""), int(time.time())),
+                            (
+                                sid,
+                                m.get("role", "user"),
+                                m.get("content", ""),
+                                int(time.time()),
+                            ),
                         )
                     migrated += 1
 
@@ -247,7 +260,11 @@ class ConversationStore:
         system_prompt: Optional[str] = None,
     ) -> Conversation:
         with self._lock:
-            conv = Conversation(title=title or "新对话", system_prompt=system_prompt)
+            conv = Conversation(
+                title=title or "新对话",
+                system_prompt=system_prompt,
+                knowledge_provider=self._knowledge_provider,
+            )
             if self._conn is not None:
                 self._conn.execute(
                     "INSERT INTO conversations(session_id, title, system_prompt, created_at, updated_at) "
@@ -325,7 +342,9 @@ class ConversationStore:
                 )
             return True
 
-    def append_message(self, session_id: str, message: ChatMessage) -> Optional[Conversation]:
+    def append_message(
+        self, session_id: str, message: ChatMessage
+    ) -> Optional[Conversation]:
         with self._lock:
             conv = self._store.get(session_id)
             if conv is None:
@@ -339,7 +358,9 @@ class ConversationStore:
                 self._touch_updated_at(session_id)
             return conv
 
-    def extend_messages(self, session_id: str, messages: List[ChatMessage]) -> Optional[Conversation]:
+    def extend_messages(
+        self, session_id: str, messages: List[ChatMessage]
+    ) -> Optional[Conversation]:
         with self._lock:
             conv = self._store.get(session_id)
             if conv is None:

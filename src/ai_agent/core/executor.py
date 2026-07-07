@@ -27,10 +27,15 @@ from typing import Any, Dict, List, Optional
 
 from ai_agent.models.action import Action, ToolAction
 from ai_agent.models.chat import ChatMessage
-from ai_agent.models.context import AgentContext, KnowledgeEntry, MemorySnapshot, RuntimeState
-
+from ai_agent.models.context import (
+    AgentContext,
+    KnowledgeEntry,
+    MemorySnapshot,
+    RuntimeState,
+)
 
 # ---------- Executor 层 ----------
+
 
 class ActionExecutor(ABC):
     """Action 执行器接口。"""
@@ -62,6 +67,7 @@ class ToolExecutor(ActionExecutor):
 
 
 # ---------- Provider 层 ----------
+
 
 class Provider(ABC):
     """所有 Provider 的基类。"""
@@ -148,6 +154,7 @@ class KnowledgeProvider(ContextProvider):
 
 
 # ---------- 空实现（用于测试和占位） ----------
+
 
 class EmptyToolProvider(ToolProvider):
     """空工具提供者（没有工具）。"""

@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from ai_agent.core.executor import ActionExecutor, ContextProvider
@@ -40,6 +39,7 @@ class AgentLoop:
         executor: ActionExecutor,
         context_provider: ContextProvider,
         llm: Optional[BaseLLM] = None,
+        bus: Optional[Any] = None,
     ) -> None:
         from ai_agent.prompts.prompt_loader import load_prompt
 
@@ -47,6 +47,7 @@ class AgentLoop:
         self._executor = executor
         self._context_provider = context_provider
         self._llm = llm
+        self._bus = bus
         self._answer_prompt = load_prompt(
             "agent/answer",
             default="你是一个智能助手。",
@@ -56,48 +57,16 @@ class AgentLoop:
     # 对外接口
     # ------------------------------------------------------------------
 
-    async def run(self, session_id: str, user_input: str) -> Dict[str, Any]:
-        """非流式执行（收集 StreamHandle 的结果）。"""
-        handle = StreamHandle(session_id=session_id)
-        handle._start_time = time.time()
-        # 启动执行（不阻塞）
-        task = self._execute(session_id, user_input, handle)
-        # 同时收集结果
-        answer = ""
-        async for item in handle.stream():
-            if item.kind == "token":
-                answer += item.delta
-        # 等待执行完成
-        await task
-        return {
-            "session_id": session_id,
-            "answer": answer,
-            "token_count": handle.token_count,
-            "duration_ms": int((time.time() - handle.start_time) * 1000),
-            "success": handle.success,
-            "error": handle.error,
-        }
-
     async def run_stream(
         self, session_id: str, user_input: str
     ) -> AsyncGenerator[StreamItem, None]:
         """流式执行：返回 AsyncGenerator[StreamItem, None]。"""
-        handle = StreamHandle(session_id=session_id)
-        handle._start_time = time.time()
-
-        # 启动执行（后台任务）
-        async def execute():
-            try:
-                await self._execute(session_id, user_input, handle)
-            except Exception as e:
-                handle._error = str(e)
-                handle.emit_error(f"Agent 执行异常：{e}")
+        handle = StreamHandle(session_id=session_id, bus=self._bus)
 
         import asyncio
 
-        asyncio.create_task(execute())
+        asyncio.create_task(self._execute(session_id, user_input, handle))
 
-        # 返回流
         async for item in handle.stream():
             yield item
 
