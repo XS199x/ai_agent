@@ -9,7 +9,7 @@ from .action import (
     tool_action,
 )
 from .chat import ChatCompletionChunk, ChatCompletionResponse, ChatMessage
-from .context import AgentContext, KnowledgeEntry, MemorySnapshot, RuntimeState
+from .context import AgentContext, MemorySnapshot, RuntimeState
 
 __all__ = [
     "ChatMessage",
@@ -25,6 +25,5 @@ __all__ = [
     "error_action",
     "AgentContext",
     "MemorySnapshot",
-    "KnowledgeEntry",
     "RuntimeState",
 ]

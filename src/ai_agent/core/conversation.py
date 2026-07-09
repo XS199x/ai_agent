@@ -7,7 +7,6 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional
 
-from ai_agent.core.executor import KnowledgeProvider
 from ai_agent.models.chat import ChatMessage
 
 SCHEMA = """
@@ -43,13 +42,11 @@ class Conversation:
         system_prompt: Optional[str] = None,
         created_at: Optional[int] = None,
         updated_at: Optional[int] = None,
-        knowledge_provider: Optional[KnowledgeProvider] = None,
     ) -> None:
         self.session_id: str = session_id or uuid.uuid4().hex
         self.title: str = title
         self.system_prompt: Optional[str] = system_prompt
         self.messages: List[ChatMessage] = []
-        self._knowledge_provider: Optional[KnowledgeProvider] = knowledge_provider
         now = int(time.time())
         self.created_at: int = created_at if created_at else now
         self.updated_at: int = updated_at if updated_at else now
@@ -69,11 +66,6 @@ class Conversation:
     def clear(self) -> None:
         self.messages = []
         self.updated_at = int(time.time())
-
-    async def retrieve_knowledge(self, query: str) -> List[Any]:
-        if self._knowledge_provider is None:
-            return []
-        return await self._knowledge_provider.retrieve(query, self.session_id)
 
     def to_dict(self) -> dict:
         return {
@@ -99,9 +91,7 @@ class ConversationStore:
         self,
         max_conversations: int = 100,
         persist_path: Optional[os.PathLike | str] = None,
-        knowledge_provider: Optional[KnowledgeProvider] = None,
     ) -> None:
-        self._knowledge_provider = knowledge_provider
         self._max = max_conversations
         self._lock = RLock()
         self._persist_path: Optional[Path] = (
@@ -124,7 +114,6 @@ class ConversationStore:
             self._conn.execute("PRAGMA foreign_keys=ON;")
             with self._lock:
                 self._conn.executescript(SCHEMA)
-                self._maybe_migrate_json()
                 self._load_all()
         else:
             self._conn = None
@@ -146,7 +135,6 @@ class ConversationStore:
                 system_prompt=r["system_prompt"],
                 created_at=r["created_at"],
                 updated_at=r["updated_at"],
-                knowledge_provider=self._knowledge_provider,
             )
             mcur = self._conn.execute(
                 "SELECT role, content, extra_json FROM messages "
@@ -182,76 +170,6 @@ class ConversationStore:
                 )
 
     # ------------------------------------------------------------------
-    # 从旧 JSON 文件迁移
-    # ------------------------------------------------------------------
-    def _maybe_migrate_json(self) -> None:
-        assert self._conn is not None
-        candidates = [
-            self._persist_path.with_suffix(".json"),
-            self._persist_path.parent / "conversations.json",
-        ]
-        for json_path in candidates:
-            if json_path and json_path.exists():
-                try:
-                    with json_path.open("r", encoding="utf-8") as f:
-                        raw = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    continue
-
-                items = raw.get("conversations") if isinstance(raw, dict) else raw
-                if not isinstance(items, list):
-                    continue
-
-                migrated = 0
-                for data in items:
-                    try:
-                        sid = data.get("session_id") or uuid.uuid4().hex
-                        title = data.get("title", "新对话")
-                        sp = data.get("system_prompt")
-                        ca = data.get("created_at") or int(time.time())
-                        ua = data.get("updated_at") or int(time.time())
-                        messages = data.get("messages") or []
-                    except Exception:
-                        continue
-
-                    # 已存在则跳过（幂等）
-                    row = self._conn.execute(
-                        "SELECT 1 FROM conversations WHERE session_id = ?",
-                        (sid,),
-                    ).fetchone()
-                    if row:
-                        continue
-
-                    self._conn.execute(
-                        "INSERT INTO conversations(session_id, title, system_prompt, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (sid, title, sp, ca, ua),
-                    )
-                    for m in messages:
-                        if not isinstance(m, dict):
-                            continue
-                        self._conn.execute(
-                            "INSERT INTO messages(session_id, role, content, created_at) "
-                            "VALUES (?, ?, ?, ?)",
-                            (
-                                sid,
-                                m.get("role", "user"),
-                                m.get("content", ""),
-                                int(time.time()),
-                            ),
-                        )
-                    migrated += 1
-
-                if migrated:
-                    # 迁移完成后把原文件改名备份
-                    try:
-                        json_path.replace(json_path.with_suffix(".json.bak"))
-                    except OSError:
-                        pass
-
-                return  # 只迁移一次第一个文件
-
-    # ------------------------------------------------------------------
     # 写操作
     # ------------------------------------------------------------------
     def create(
@@ -263,7 +181,6 @@ class ConversationStore:
             conv = Conversation(
                 title=title or "新对话",
                 system_prompt=system_prompt,
-                knowledge_provider=self._knowledge_provider,
             )
             if self._conn is not None:
                 self._conn.execute(

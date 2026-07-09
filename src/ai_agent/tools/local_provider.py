@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ai_agent.core.executor import ToolProvider
+from ai_agent.core.provider import ToolProvider
 from ai_agent.models.action import Action, ToolAction, tool_action
 from ai_agent.tools.base import BaseTool, ToolRegistry
 

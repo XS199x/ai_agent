@@ -21,7 +21,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 
-from ai_agent.core.executor import ToolProvider
+from ai_agent.core.provider import ToolProvider
 from ai_agent.llm.base import BaseLLM
 from ai_agent.models.action import (
     Action,

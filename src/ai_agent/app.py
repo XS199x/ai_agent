@@ -1,12 +1,13 @@
 """FastAPI 应用入口。
 
 使用新架构：
-- AgentLoop（核心循环）
-- LLMPlanner（决策层）
-- ToolExecutor（执行层）
+- AgentRuntime（运行时：循环控制、异常处理）
+- ContextManager（上下文管理：构建、更新、压缩）
+- ActionDispatcher（动作分发：注册 Handler、分发执行）
+- LLMPlanner（决策层：AI 推理）
+- ToolExecutor（工具执行）
 - LocalToolProvider（工具提供者）
 - SimpleContextProvider（上下文提供者）
-- DefaultPromptBuilder（提示词构建）
 """
 
 from contextlib import asynccontextmanager
@@ -18,17 +19,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from ai_agent.core.agent_loop import AgentLoop
+from ai_agent.core.action_dispatcher import (
+    ActionDispatcher,
+    AnswerActionHandler,
+    ErrorActionHandler,
+    ToolActionHandler,
+)
+from ai_agent.core.agent_runtime import AgentRuntime
 from ai_agent.core.application_profile import ApplicationProfile
-from ai_agent.core.context_provider import SimpleContextProvider
+from ai_agent.core.context_manager import DefaultContextManager
+from ai_agent.core.context_provider import (
+    ApplicationProvider,
+    ConversationProvider,
+    MemoryProvider,
+    RuntimeProvider,
+)
 from ai_agent.core.conversation import Conversation, ConversationStore
 from ai_agent.core.event import EventBus, get_default_bus
 from ai_agent.core.executor import ToolExecutor
-from ai_agent.core.knowledge.file_knowledge_provider import FileKnowledgeProvider
 from ai_agent.core.planner import LLMPlanner
 from ai_agent.core.stream import item_to_sse_line
 from ai_agent.llm.base import BaseLLM
 from ai_agent.llm.factory import create_llm
+from ai_agent.models.chat import ChatMessage
 from ai_agent.tools.base import ToolRegistry
 from ai_agent.tools.calculator import CalculatorTool
 from ai_agent.tools.datetime_tool import DateTimeTool
@@ -98,51 +111,62 @@ def build_app_state(
     """构建完整的运行时依赖图。
 
     流程：
-      1. 创建基础基础设施（LLM / EventBus / KnowledgeProvider / ConversationStore / ToolRegistry）
+      1. 创建基础基础设施（LLM / EventBus / ConversationStore / ToolRegistry）
       2. 读取 Application Profiles —— 每个 Profile 描述一个 Agent 应用
-      3. 按 Profile 构造 AgentLoop
+      3. 按 Profile 构造 AgentRuntime
 
     做一个新应用 → 新增 Application Profile；不用改这里的任何一行。
     """
     bus = bus or get_default_bus()
 
-    knowledge_provider = FileKnowledgeProvider(_project_root / "data" / "knowledge")
-    import asyncio
-
-    asyncio.run(knowledge_provider.setup())
-
     store = store or ConversationStore(
         max_conversations=_max_conversations,
         persist_path=_persist_path,
-        knowledge_provider=knowledge_provider,
     )
     llm = llm or create_llm()
     tool_registry = tool_registry or build_tool_registry()
 
     profiles = profiles or _default_profiles()
 
-    agent_loops: Dict[str, AgentLoop] = {}
+    agent_runtimes: Dict[str, AgentRuntime] = {}
 
     for profile in profiles.values():
         system_prompt_text = profile.resolve_system_prompt()
 
-        # Agent 应用：构造 Planner + Executor + AgentLoop
         resolved_tools = profile.resolve_tools(tool_registry)
         local_registry = ToolRegistry()
         for t in resolved_tools:
             local_registry.register(t)
         tool_provider = LocalToolProvider(local_registry)
         tool_executor = ToolExecutor(tool_provider)
-        context_provider = SimpleContextProvider(tool_provider, store)
+
+        providers = [
+            ConversationProvider(store),
+            MemoryProvider(),
+            ApplicationProvider(tool_provider),
+            RuntimeProvider(profile.max_iterations),
+        ]
+        context_manager = DefaultContextManager(
+            providers=providers,
+            llm=llm,
+            answer_prompt=system_prompt_text,
+        )
+
+        dispatcher = ActionDispatcher()
+        dispatcher.register_handler(ToolActionHandler(tool_executor))
+        dispatcher.register_handler(AnswerActionHandler())
+        dispatcher.register_handler(ErrorActionHandler())
+
         planner = LLMPlanner(
             llm=llm,
             tool_provider=tool_provider,
             system_prompt=system_prompt_text,
         )
-        agent_loops[profile.name] = AgentLoop(
+
+        agent_runtimes[profile.name] = AgentRuntime(
             planner=planner,
-            executor=tool_executor,
-            context_provider=context_provider,
+            context_manager=context_manager,
+            dispatcher=dispatcher,
             llm=llm,
             bus=bus,
         )
@@ -153,7 +177,7 @@ def build_app_state(
         store=store,
         tool_registry=tool_registry,
         profiles=profiles,
-        agent_loops=agent_loops,
+        agent_runtimes=agent_runtimes,
     )
 
 
@@ -167,25 +191,25 @@ class AppState:
         store: ConversationStore,
         tool_registry: ToolRegistry,
         profiles: Dict[str, ApplicationProfile],
-        agent_loops: Dict[str, AgentLoop],
+        agent_runtimes: Dict[str, AgentRuntime],
     ) -> None:
         self.llm = llm
         self.bus = bus
         self.store = store
         self.tool_registry = tool_registry
         self.profiles = profiles
-        self.agent_loops = agent_loops
+        self.agent_runtimes = agent_runtimes
 
     @property
-    def agent_loop(self) -> AgentLoop:
-        if "agent" in self.agent_loops:
-            return self.agent_loops["agent"]
-        if not self.agent_loops:
+    def agent_runtime(self) -> AgentRuntime:
+        if "agent" in self.agent_runtimes:
+            return self.agent_runtimes["agent"]
+        if not self.agent_runtimes:
             raise RuntimeError(
                 "没有注册任何 Agent 模式的应用。请在 _default_profiles() 中添加"
                 "一个 ApplicationProfile.agent_app()。"
             )
-        return next(iter(self.agent_loops.values()))
+        return next(iter(self.agent_runtimes.values()))
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +224,7 @@ async def lifespan(fastapi_app: FastAPI):
     yield
 
 
-app = FastAPI(title="AI Agent API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="AI Agent API", version="0.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -289,7 +313,17 @@ async def create_conversation(request: Request, req: CreateConversationRequest) 
     state = state_of(request)
     conv = state.store.create(title=req.title, system_prompt=req.system_prompt)
     if req.initial_messages:
-        conv.extend(req.initial_messages)
+        messages = []
+        for m in req.initial_messages:
+            if isinstance(m, dict):
+                messages.append(
+                    ChatMessage(
+                        role=m.get("role", "user"), content=m.get("content", "")
+                    )
+                )
+            else:
+                messages.append(ChatMessage(role="user", content=str(m)))
+        conv.extend(messages)
     return {"conversation": conv.to_dict()}
 
 
@@ -391,8 +425,10 @@ async def agent_chat(request: Request, req: ChatRequest):
 
 
 async def _agent_sse(state, session_id: str, user_input: str):
-    """把 AgentLoop.run_stream 转成 SSE 文本流。"""
-    async for sse_line in _to_sse(state.agent_loop.run_stream(session_id, user_input)):
+    """把 AgentRuntime.run_stream 转成 SSE 文本流。"""
+    async for sse_line in _to_sse(
+        state.agent_runtime.run_stream(session_id, user_input)
+    ):
         yield sse_line
 
 

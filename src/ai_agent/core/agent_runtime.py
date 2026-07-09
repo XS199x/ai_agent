@@ -1,78 +1,78 @@
-"""AgentLoop：整个 Agent Runtime 的唯一核心。
+"""AgentRuntime：Agent 运行时。
 
-使用 StreamHandle 作为流式输出的中间层：
-- AgentLoop 调用 StreamHandle.emit_* 方法
-- StreamHandle 内部写入 asyncio.Queue，同时 emit 到 EventBus
-- FastAPI 消费 StreamHandle.stream() 转成 SSE
+职责：
+1. 控制 Agent 生命周期
+2. 管理推理循环（多步）
+3. 处理异常和中断
+4. 管理迭代次数和超时
 
-所有关键状态都通过 StreamHandle.emit_event 抛出去：
-- log: 运行日志
-- iteration: 迭代次数
-- planner_result: Planner 决策结果
-- tool_call: 工具调用
-- tool_result: 工具结果
-- tool_error: 工具错误
-- llm_start: 开始生成回答
-- llm_messages: 传给 LLM 的消息摘要
-- llm_completed: 回答生成完成
-- done: 结束
+设计原则：
+- 不包含业务逻辑，只做控制流
+- 与 Planner/ContextManager/ActionDispatcher 解耦
+- 支持真正的多步推理：工具结果回灌到上下文后再次交给 Planner
+
+数据流：
+用户输入 → ContextManager.build_initial() → AgentContext
+           ↓
+         Planner.plan() → Action
+           ↓
+         ActionDispatcher.dispatch() → Result
+           ↓
+         ContextManager.update() → 新 AgentContext
+           ↓
+         循环直到 Planner 返回 AnswerAction 或达到 max_iterations
 """
 
 from __future__ import annotations
 
-from typing import Any, AsyncGenerator, Dict, List, Optional
+import asyncio
+from typing import Any, AsyncGenerator, Optional
 
-from ai_agent.core.executor import ActionExecutor, ContextProvider
+from ai_agent.core.action_dispatcher import ActionDispatcher
+from ai_agent.core.context_manager import ContextManager
 from ai_agent.core.planner import Planner
 from ai_agent.core.stream import StreamHandle, StreamItem
 from ai_agent.llm.base import BaseLLM
 from ai_agent.models.action import Action, AnswerAction, ErrorAction, ToolAction
-from ai_agent.models.chat import ChatMessage
+from ai_agent.models.context import AgentContext
 
 
-class AgentLoop:
-    """Agent 的核心循环。"""
+class AgentRuntime:
+    """Agent 运行时。"""
 
     def __init__(
         self,
         planner: Planner,
-        executor: ActionExecutor,
-        context_provider: ContextProvider,
+        context_manager: ContextManager,
+        dispatcher: ActionDispatcher,
         llm: Optional[BaseLLM] = None,
         bus: Optional[Any] = None,
     ) -> None:
-        from ai_agent.prompts.prompt_loader import load_prompt
-
         self._planner = planner
-        self._executor = executor
-        self._context_provider = context_provider
+        self._context_manager = context_manager
+        self._dispatcher = dispatcher
         self._llm = llm
         self._bus = bus
-        self._answer_prompt = load_prompt(
-            "agent/answer",
-            default="你是一个智能助手。",
-        )
-
-    # ------------------------------------------------------------------
-    # 对外接口
-    # ------------------------------------------------------------------
 
     async def run_stream(
         self, session_id: str, user_input: str
     ) -> AsyncGenerator[StreamItem, None]:
         """流式执行：返回 AsyncGenerator[StreamItem, None]。"""
         handle = StreamHandle(session_id=session_id, bus=self._bus)
+        task = asyncio.create_task(self._execute(session_id, user_input, handle))
 
-        import asyncio
-
-        asyncio.create_task(self._execute(session_id, user_input, handle))
-
-        async for item in handle.stream():
-            yield item
-
-    # ------------------------------------------------------------------
-    # 内部执行逻辑
-    # ------------------------------------------------------------------
+        try:
+            async for item in handle.stream():
+                yield item
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            if task.done() and task.exception() is not None and not handle._done:
+                handle.emit_error(str(task.exception()))
 
     async def _execute(
         self,
@@ -80,11 +80,12 @@ class AgentLoop:
         user_input: str,
         handle: StreamHandle,
     ) -> None:
-        """核心执行逻辑：决策 → 工具 → 回答。"""
+        """核心执行逻辑：多步推理循环。"""
         iteration = 0
         try:
-            context = await self._context_provider.get_context(session_id, user_input)
+            context = await self._context_manager.build_initial(session_id, user_input)
             max_iter = context.runtime_state.max_iterations
+
             handle.emit_event(
                 "log",
                 {
@@ -96,16 +97,15 @@ class AgentLoop:
             while iteration < max_iter:
                 iteration += 1
 
-                # 1. 迭代开始
                 handle.emit_event(
                     "iteration",
                     {"iteration": iteration, "message": f"第 {iteration} 步推理中..."},
                 )
 
-                # 2. Planner 决策
                 action = await self._planner.plan(context)
                 action_type = type(action).__name__
                 action_info = {"type": action_type, "thought": action.thought}
+
                 if isinstance(action, ToolAction):
                     action_info["tool"] = action.name
                     action_info["args"] = action.args
@@ -118,7 +118,6 @@ class AgentLoop:
 
                 handle.emit_event("planner_result", action_info)
 
-                # ---- 分支 1：终止性动作 ----
                 if action.is_terminal():
                     if isinstance(action, ErrorAction):
                         handle.emit_event(
@@ -136,26 +135,22 @@ class AgentLoop:
                         )
                         return
 
-                    # AnswerAction: 直接回答
-                    handle.emit_event(
-                        "llm_start",
-                        {"message": "开始生成答案...", "source": "direct_answer"},
-                    )
-                    messages = self._build_llm_messages(context)
-                    handle.emit_event(
-                        "llm_messages",
-                        {
-                            "count": len(messages),
-                            "summary": self._summarize_messages(messages),
-                        },
-                    )
-                    await self._streaming_answer(handle, messages)
-                    handle.emit_event("llm_completed", {"message": "回答生成完成"})
-                    handle._success = True
-                    handle.emit_done({"success": True, "iteration": iteration})
+                    if isinstance(action, AnswerAction):
+                        await self._handle_answer_action(handle, context, action)
+                        handle._success = True
+                        handle.emit_done({"success": True, "iteration": iteration})
+                    else:
+                        handle._error = f"未知的终止动作类型: {type(action).__name__}"
+                        handle.emit_token(f"错误：未知的终止动作类型")
+                        handle.emit_done(
+                            {
+                                "success": False,
+                                "iteration": iteration,
+                                "error": handle._error,
+                            }
+                        )
                     return
 
-                # ---- 分支 2：工具调用 ----
                 if not isinstance(action, ToolAction):
                     handle.emit_event(
                         "log",
@@ -184,7 +179,7 @@ class AgentLoop:
                 )
 
                 try:
-                    observation = await self._executor.execute(action)
+                    observation = await self._dispatcher.dispatch(action)
                     handle.emit_event(
                         "tool_result",
                         {
@@ -193,26 +188,18 @@ class AgentLoop:
                             "observation_full": str(observation),
                         },
                     )
-                    context = context.with_action_result(action, observation)
 
-                    # 工具执行完 —— 生成最终回答
-                    handle.emit_event(
-                        "llm_start",
-                        {"message": "根据工具结果生成答案...", "source": "after_tool"},
+                    context = await self._context_manager.update(
+                        context, action, observation
                     )
-                    messages = self._build_llm_messages(context)
+
                     handle.emit_event(
-                        "llm_messages",
+                        "log",
                         {
-                            "count": len(messages),
-                            "summary": self._summarize_messages(messages),
+                            "message": f"工具 {tool_name} 执行完成，上下文已更新，继续推理",
+                            "level": "info",
                         },
                     )
-                    await self._streaming_answer(handle, messages)
-                    handle.emit_event("llm_completed", {"message": "回答生成完成"})
-                    handle._success = True
-                    handle.emit_done({"success": True, "iteration": iteration})
-                    return
 
                 except Exception as e:
                     handle.emit_event(
@@ -225,8 +212,8 @@ class AgentLoop:
                     )
                     return
 
-            # 最大迭代次数
             handle._error = "max_iterations_reached"
+            handle.emit_token("达到最大迭代次数，推理结束。")
             handle.emit_done(
                 {
                     "success": False,
@@ -244,43 +231,33 @@ class AgentLoop:
             handle.emit_done(
                 {"success": False, "iteration": iteration, "error": str(e)}
             )
-
-    # ------------------------------------------------------------------
-    # 辅助方法
-    # ------------------------------------------------------------------
-
-    def _build_llm_messages(self, context: Any) -> List[ChatMessage]:
-        """构建传给 LLM 的完整消息列表。"""
-        messages: List[ChatMessage] = []
-        messages.append(ChatMessage(role="system", content=self._answer_prompt))
-        conversation = getattr(context, "conversation", [])
-        if conversation:
-            messages.extend(conversation)
-        return messages
-
-    def _summarize_messages(self, messages: List[ChatMessage]) -> List[Dict[str, str]]:
-        """生成消息摘要。"""
-        summary = []
-        for i, msg in enumerate(messages):
-            summary.append(
-                {
-                    "role": msg.role,
-                    "content_preview": msg.content[:80] if msg.content else "",
-                }
-            )
-            if i >= 5:
-                summary.append(
-                    {
-                        "role": "...",
-                        "content_preview": f"+{len(messages) - 5} 条更多消息",
-                    }
+        finally:
+            if not handle._done:
+                handle._error = handle._error or "execution_aborted"
+                handle.emit_done(
+                    {"success": False, "iteration": iteration, "error": handle._error}
                 )
-                break
-        return summary
 
-    async def _streaming_answer(
-        self, handle: StreamHandle, messages: List[ChatMessage]
+    async def _handle_answer_action(
+        self, handle: StreamHandle, context: AgentContext, action: AnswerAction
     ) -> None:
+        """处理回答动作：生成最终答案。"""
+        handle.emit_event(
+            "llm_start",
+            {"message": "开始生成答案...", "source": "direct_answer"},
+        )
+        messages = self._context_manager.build_llm_messages(context)
+        handle.emit_event(
+            "llm_messages",
+            {
+                "count": len(messages),
+                "summary": self._context_manager.summarize_messages(messages),
+            },
+        )
+        await self._streaming_answer(handle, messages)
+        handle.emit_event("llm_completed", {"message": "回答生成完成"})
+
+    async def _streaming_answer(self, handle: StreamHandle, messages: Any) -> None:
         """调用 llm.chat_stream 流式生成回答，写入 StreamHandle。"""
         if self._llm is None:
             fallback = "（LLM 未配置）"
