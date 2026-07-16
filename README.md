@@ -4,44 +4,57 @@
 
 ```
 src/ai_agent/
-├── app.py                 # FastAPI 应用入口，构建依赖图和路由
+├── app.py                 # FastAPI 应用入口
 ├── config.py              # Pydantic 配置管理
 ├── main.py                # 应用启动入口
+├── dependencies.py        # 依赖构建（依赖图）
+├── schemas.py             # 请求/响应模型
+├── routes/                # API 路由
+│   ├── __init__.py
+│   ├── agent_routes.py    # Agent 聊天路由
+│   └── conversation_routes.py  # 会话管理路由
 ├── core/                  # 核心组件
-│   ├── agent_runtime.py   # AgentRuntime（运行时：循环控制、异常处理）
-│   ├── action_dispatcher.py  # ActionDispatcher（动作分发：注册 Handler、分发执行）
-│   ├── application_profile.py  # 应用配置文件（system_prompt / tools / max_iterations）
-│   ├── context_manager.py     # ContextManager（上下文管理：构建、更新、压缩）
-│   ├── context_provider.py    # 上下文提供者（从 Store 获取数据，组装 AgentContext）
-│   ├── conversation.py    # 会话模型 + SQLite 持久化存储
-│   ├── event.py           # 事件总线（EventBus）
-│   ├── executor.py        # 执行器 + Provider 接口定义
-│   ├── planner.py         # LLM Planner（根据 Context 决策下一步动作）
-│   ├── stream.py          # 流式输出处理（SSE）
-│   └── knowledge/         # 知识库模块
-│       └── file_knowledge_provider.py  # 基于文件的知识库实现
+│   ├── __init__.py
+│   ├── agent_runtime.py   # AgentRuntime（运行时：循环控制）
+│   ├── action_executor.py # ActionExecutor（动作执行）
+│   ├── application_profile.py  # 应用配置
+│   ├── context_manager.py     # ContextManager（上下文管理）
+│   ├── context_provider.py    # 上下文提供者
+│   ├── event.py           # EventBus（事件总线）
+│   ├── handlers/          # 事件处理器
+│   │   └── __init__.py
+│   ├── planner.py         # LLM Planner（决策）
+│   ├── policy.py          # RuntimePolicy（策略：迭代/超时/取消）
+│   ├── provider.py        # Provider 基类
+│   ├── stream.py          # 流式输出处理
+│   └── observer.py        # 事件观察者
+├── persistence/           # 持久化层
+│   ├── __init__.py
+│   ├── models.py          # 领域模型（Conversation）
+│   └── store.py           # SQLite 存储（ConversationStore）
 ├── llm/                   # LLM 抽象层
 │   ├── base.py            # BaseLLM 抽象接口
 │   ├── factory.py         # LLM 实例工厂
 │   └── deepseek.py        # DeepSeek 实现
 ├── models/                # 数据模型
-│   ├── action.py          # Action / ToolAction 定义
+│   ├── action.py          # Action / ToolAction / AnswerAction 定义
 │   ├── chat.py            # ChatMessage 定义
-│   └── context.py         # AgentContext（决策上下文快照）
+│   ├── context.py         # AgentContext（决策上下文快照）
+│   └── runtime.py         # ExecutionResult / RuntimeEvent 定义
 ├── prompts/               # Prompt 模板（集中管理）
-│   ├── agent/answer.txt   # 回答生成模板
 │   ├── defaults/system.txt # 默认系统提示词
+│   ├── agent_system.txt   # Agent 系统提示词
+│   ├── answer.txt         # 回答提示词
 │   └── prompt_loader.py   # Prompt 加载器
 └── tools/                 # 工具模块
-    ├── base.py            # BaseTool 抽象接口
+    ├── base.py            # BaseTool 抽象接口 + ToolRegistry
     ├── calculator.py      # 计算器工具
     ├── datetime_tool.py   # 日期时间工具
     ├── local_provider.py  # 本地工具提供者
     └── text_stats_tool.py # 文本统计工具
 
 data/
-├── conversations.db       # SQLite 会话数据库（自动创建）
-└── knowledge/             # 知识库文件目录（.md / .txt）
+└── conversations.db       # SQLite 会话数据库（自动创建）
 ```
 
 ## 二、核心架构
@@ -51,20 +64,20 @@ data/
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                      API Layer                          │
-│         (FastAPI routes: /agent/chat, /conversations)   │
+│         (routes: /agent/chat, /conversations)           │
 └────────────────────────────┬────────────────────────────┘
                              │
 ┌────────────────────────────▼────────────────────────────┐
 │                   AgentRuntime                          │
-│     (运行时：循环控制、迭代计数、超时、异常、中断)          │
+│     (运行时：循环控制、迭代计数、超时、取消)               │
 └────────────────────────────┬────────────────────────────┘
                              │
         ┌────────────────────┼────────────────────┐
         ▼                    ▼                    ▼
 ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
 │              │    │              │    │              │
-│  Planner     │    │ ContextManager│    │ ActionDispatcher│
-│  (AI决策)    │    │ (上下文管理)   │    │ (动作分发)     │
+│  Planner     │    │ ContextManager│    │ ActionExecutor│
+│  (AI决策)    │    │ (上下文管理)   │    │ (动作执行)     │
 │              │    │              │    │              │
 └───────┬───────┘    └───────┬───────┘    └───────┬───────┘
         │                    │                    │
@@ -73,8 +86,8 @@ data/
 ┌────────────────────────────▼────────────────────────────┐
 │              资源层（Capability / Service）               │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐     │
-│  │Conversation  │ │ Knowledge    │ │ ToolProvider │     │
-│  │   Store      │ │   Provider   │ │              │     │
+│  │Conversation  │ │ EventBus     │ │ ToolProvider │     │
+│  │   Store      │ │ (事件总线)   │ │              │     │
 │  └──────────────┘ └──────────────┘ └──────────────┘     │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -95,32 +108,30 @@ data/
 - **只负责决策，不执行**
 
 #### ContextManager
-- 构建初始 AgentContext（从 ContextProvider 获取）
-- 更新上下文（将工具执行结果回灌）
-- 构建 LLM 消息列表
-- 上下文压缩（超长对话时进行摘要）
-- **不包含业务逻辑，只做数据转换**
+- 构建初始 AgentContext（遍历 ContextProvider 收集数据）
+- 消费 ExecutionResult 更新上下文（通过 consume() 方法）
+- **不包含业务逻辑，只做数据转换和组装**
 
-#### ActionDispatcher
-- 注册 Action Handler（ToolActionHandler / AnswerActionHandler / ErrorActionHandler）
-- 根据 Action 类型分发到对应 Handler 执行
-- 新增 Action 类型只需注册新 Handler，不改核心代码
-- **不包含业务逻辑，只做分发**
+#### ActionExecutor
+- 执行所有类型的 Action（ToolAction / AnswerAction / ErrorAction）
+- 返回统一的 ExecutionResult（包含事件列表）
+- 处理异常，包装成 ExecutionResult.error()
+- 支持 CancellationToken 和 RetryPolicy
+- **不包含业务逻辑，只做执行和异常封装**
 
 #### ContextProvider
 - 从各种资源提供者获取数据
-- 组装成 AgentContext（不可变快照）
-- 当前实现：SimpleContextProvider
+- 每个 Provider 只负责填充 AgentContext 的一个字段
+- 当前实现：ConversationProvider / MemoryProvider / ApplicationProvider / RuntimeProvider
 
 #### ConversationStore
 - SQLite 持久化存储会话
 - 管理会话的完整生命周期（创建、读取、更新、删除）
-- **内部集成知识库检索**：通过 Conversation.retrieve_knowledge() 对外隐藏
 
-#### KnowledgeProvider
-- 知识库检索接口
-- 当前实现：FileKnowledgeProvider（基于文件的关键词检索）
-- **对外隐藏**：通过 Conversation 内部调用，不直接暴露给 API
+#### EventBus
+- 事件发布/订阅机制
+- 支持同步 emit() 和异步 emit_async()
+- 内置处理器：PrintLogHandler、TokenCountHandler、ConversationPersistHandler
 
 ## 三、数据流向
 
@@ -135,9 +146,9 @@ data/
                           ↓
                     Planner.plan() → Action
                           ↓
-                    ActionDispatcher.dispatch() → Result
+                    ActionExecutor.execute() → ExecutionResult
                           ↓
-                    ContextManager.update() → 新 AgentContext
+                    ContextManager.consume() → 新 AgentContext
                           ↓
                     循环直到 Planner 返回 AnswerAction 或达到 max_iterations
                           ↓
@@ -151,12 +162,11 @@ data/
 ```python
 @dataclass(frozen=True)
 class AgentContext:
-    conversation: List[ChatMessage]      # 会话历史
-    memory: MemorySnapshot                # 长期记忆
-    knowledge: List[KnowledgeEntry]       # RAG 检索结果
-    available_actions: List[Action]       # 可用工具列表
-    runtime_state: RuntimeState           # 运行时状态
-    user_input: str                       # 当前用户输入
+    conversation: List[ChatMessage]  # 会话历史
+    memory: MemorySnapshot  # 长期记忆
+    available_actions: List[Action]  # 可用工具列表
+    runtime_state: RuntimeState  # 运行时状态
+    user_input: str  # 当前用户输入
 ```
 
 ## 四、关键设计原则
@@ -165,10 +175,10 @@ class AgentContext:
 
 | 原则 | 说明 |
 |------|------|
-| 知识库隐藏 | KnowledgeProvider 通过 Conversation.retrieve_knowledge() 内部调用，API 层不直接访问 |
 | 持久化隐藏 | ContextProvider 不关心数据如何持久化，只依赖 ConversationStore 接口 |
 | 接口隔离 | Provider 只提供资源，Executor 只执行动作，Planner 只做决策 |
-| 控制流与业务分离 | AgentRuntime/ContextManager/ActionDispatcher 不包含业务逻辑 |
+| 控制流与业务分离 | AgentRuntime/ContextManager/ActionExecutor 不包含业务逻辑 |
+| 事件驱动 | 通过 EventBus 发布事件，Observer 决定如何处理（日志、持久化等） |
 
 ### 4.2 依赖注入
 
@@ -178,29 +188,48 @@ class AgentContext:
 def build_app_state():
     # 1. 基础基础设施
     bus = EventBus()
-    knowledge_provider = FileKnowledgeProvider()
-    store = ConversationStore(knowledge_provider=knowledge_provider)
-    
-    # 2. 业务组件
+    store = ConversationStore(max_conversations=100)
     llm = create_llm()
+    tool_registry = ToolRegistry()
+    tool_registry.register(CalculatorTool())
+    tool_registry.register(DateTimeTool())
+    
+    bus.subscribe(ConversationPersistHandler(store))
+    
+    # 2. 按 ApplicationProfile 构造 AgentRuntime
+    profile = ApplicationProfile.agent_app(
+        "agent",
+        system_prompt="agent_system",
+        tools=["calculator", "datetime"],
+    )
+    
+    # 3. 工具提供者
     tool_provider = LocalToolProvider(tool_registry)
-    tool_executor = ToolExecutor(tool_provider)
     
-    # 3. 上下文管理
-    context_provider = SimpleContextProvider(tool_provider, store)
-    context_manager = DefaultContextManager(context_provider, llm)
+    # 4. 上下文提供者
+    providers = [
+        ConversationProvider(store, bus),
+        MemoryProvider(),
+        ApplicationProvider(tool_provider),
+        RuntimeProvider(max_iterations=5),
+    ]
+    context_manager = DefaultContextManager(providers=providers, bus=bus)
     
-    # 4. 动作分发
-    dispatcher = ActionDispatcher()
-    dispatcher.register_handler(ToolActionHandler(tool_executor))
-    dispatcher.register_handler(AnswerActionHandler())
-    dispatcher.register_handler(ErrorActionHandler())
+    # 5. 执行器和 Planner
+    executor = ActionExecutor(tool_provider=tool_provider, llm=llm)
+    planner = LLMPlanner(llm=llm, tool_provider=tool_provider)
     
-    # 5. Planner
-    planner = LLMPlanner(llm, tool_provider)
+    # 6. 策略
+    policy = RuntimePolicy(max_iterations=5, timeout_seconds=300)
     
-    # 6. Agent 实例
-    agent_runtime = AgentRuntime(planner, context_manager, dispatcher, llm, bus)
+    # 7. Agent 实例
+    agent_runtime = AgentRuntime(
+        planner=planner,
+        context_manager=context_manager,
+        executor=executor,
+        bus=bus,
+        policy=policy,
+    )
 ```
 
 ### 4.3 扩展方式
@@ -210,9 +239,9 @@ def build_app_state():
 | 新应用 | 新增 ApplicationProfile（配置 system_prompt + tools） |
 | 新工具 | 继承 BaseTool，注册到 ToolRegistry |
 | 新 LLM | 继承 BaseLLM，在 factory.py 中添加 |
-| 新知识库 | 继承 KnowledgeProvider，替换 FileKnowledgeProvider |
-| 新上下文 | 继承 ContextProvider，替换 SimpleContextProvider |
-| 新 Action 类型 | 继承 Action，实现对应 Handler，注册到 ActionDispatcher |
+| 新上下文 | 继承 ContextProvider，添加到 DefaultContextManager |
+| 新 Action 类型 | 继承 Action，在 ActionExecutor.execute() 中添加分支 |
+| 新事件处理器 | 实现 Event handler，订阅到 EventBus |
 
 ## 五、配置与运行
 
@@ -232,10 +261,6 @@ MAX_CONVERSATIONS=100
 uv run python -m ai_agent.main
 ```
 
-### 5.3 知识库
-
-在 `data/knowledge/` 目录下放置 `.md` 或 `.txt` 文件，系统会自动加载并索引。
-
 ## 六、架构约束
 
 以下变更需要讨论后再执行：
@@ -253,4 +278,5 @@ uv run python -m ai_agent.main
 - 避免全局变量，通过依赖注入传递
 - Prompt 使用 `.txt` 文件管理，不硬编码在 Python 中
 - 新增功能优先考虑扩展，而非修改核心组件
-- 核心控制流模块（AgentRuntime/ContextManager/ActionDispatcher）不包含业务逻辑
+- 核心控制流模块（AgentRuntime/ContextManager/ActionExecutor）不包含业务逻辑
+- 文件拆分原则：一个文件一个职责，避免大文件

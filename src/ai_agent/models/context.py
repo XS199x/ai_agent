@@ -75,6 +75,7 @@ class AgentContext:
     available_actions: List[Action] = field(default_factory=list)
     runtime_state: RuntimeState = field(default_factory=RuntimeState)
     user_input: str = ""
+    system_prompt_snippets: str = ""
 
     context_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
 

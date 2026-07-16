@@ -1,13 +1,16 @@
+"""对话持久化存储：基于 SQLite 的线程安全实现。"""
+
 import json
 import os
 import sqlite3
 import time
-import uuid
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional
 
-from ai_agent.models.chat import ChatMessage
+from ai_agent.models.chat import ChatMessage, FunctionCall, ToolCall
+
+from .models import Conversation
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -22,7 +25,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id   TEXT NOT NULL,
     role         TEXT NOT NULL,
-    content      TEXT NOT NULL,
+    content      TEXT,
     extra_json   TEXT,
     created_at   INTEGER NOT NULL,
     FOREIGN KEY(session_id) REFERENCES conversations(session_id) ON DELETE CASCADE
@@ -32,60 +35,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id ASC);
 """
 
 
-class Conversation:
-    """表示一个独立的会话，包含历史消息与元数据。"""
-
-    def __init__(
-        self,
-        session_id: Optional[str] = None,
-        title: str = "新对话",
-        system_prompt: Optional[str] = None,
-        created_at: Optional[int] = None,
-        updated_at: Optional[int] = None,
-    ) -> None:
-        self.session_id: str = session_id or uuid.uuid4().hex
-        self.title: str = title
-        self.system_prompt: Optional[str] = system_prompt
-        self.messages: List[ChatMessage] = []
-        now = int(time.time())
-        self.created_at: int = created_at if created_at else now
-        self.updated_at: int = updated_at if updated_at else now
-
-    def rename(self, title: str) -> None:
-        self.title = title
-        self.updated_at = int(time.time())
-
-    def append(self, message: ChatMessage) -> None:
-        self.messages.append(message)
-        self.updated_at = int(time.time())
-
-    def extend(self, messages: List[ChatMessage]) -> None:
-        self.messages.extend(messages)
-        self.updated_at = int(time.time())
-
-    def clear(self) -> None:
-        self.messages = []
-        self.updated_at = int(time.time())
-
-    def to_dict(self) -> dict:
-        return {
-            "session_id": self.session_id,
-            "title": self.title,
-            "system_prompt": self.system_prompt,
-            "messages": [m.model_dump() for m in self.messages],
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-
-
 class ConversationStore:
-    """线程安全的 SQLite 会话存储。
-
-    - 创建/获取/列表/重命名/更新 system_prompt/清空消息/删除/追加消息 都会立即落盘；
-    - 若存在旧的 JSON 文件（`{db_path}.json` 或同目录下 `conversations.json`），
-      初始化时会自动迁移一次并改名备份；
-    - persist_path 为 None 时退化为纯内存（主要用于测试/旧兼容）。
-    """
+    """线程安全的 SQLite 会话存储。"""
 
     def __init__(
         self,
@@ -98,7 +49,6 @@ class ConversationStore:
             Path(persist_path).expanduser().resolve() if persist_path else None
         )
 
-        # 内存索引：保证读取路径统一
         self._store: Dict[str, Conversation] = {}
         self._order: List[str] = []
 
@@ -107,7 +57,7 @@ class ConversationStore:
             self._conn = sqlite3.connect(
                 str(self._persist_path),
                 check_same_thread=False,
-                isolation_level=None,  # 我们用显式事务
+                isolation_level=None,
             )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL;")
@@ -118,9 +68,6 @@ class ConversationStore:
         else:
             self._conn = None
 
-    # ------------------------------------------------------------------
-    # SQLite 辅助
-    # ------------------------------------------------------------------
     def _load_all(self) -> None:
         assert self._conn is not None
         cur = self._conn.execute(
@@ -142,7 +89,38 @@ class ConversationStore:
                 (r["session_id"],),
             )
             for mr in mcur.fetchall():
-                msg = ChatMessage(role=mr["role"], content=mr["content"])
+                extra_data = {}
+                if mr["extra_json"]:
+                    try:
+                        extra_data = json.loads(mr["extra_json"])
+                    except Exception:
+                        pass
+
+                tool_calls_data = extra_data.get("tool_calls", [])
+                tool_calls = []
+                for tc_data in tool_calls_data:
+                    try:
+                        func_data = tc_data.get("function", {})
+                        tool_calls.append(
+                            ToolCall(
+                                id=tc_data.get("id", ""),
+                                type=tc_data.get("type", "function"),
+                                function=FunctionCall(
+                                    name=func_data.get("name", ""),
+                                    arguments=func_data.get("arguments", "{}"),
+                                ),
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                msg = ChatMessage(
+                    role=mr["role"],
+                    content=mr["content"],
+                    name=extra_data.get("name"),
+                    tool_call_id=extra_data.get("tool_call_id"),
+                    tool_calls=tool_calls if tool_calls else None,
+                )
                 conv.messages.append(msg)
             self._store[conv.session_id] = conv
             self._order.append(conv.session_id)
@@ -169,9 +147,6 @@ class ConversationStore:
                     (oldest,),
                 )
 
-    # ------------------------------------------------------------------
-    # 写操作
-    # ------------------------------------------------------------------
     def create(
         self,
         title: Optional[str] = None,
@@ -252,7 +227,6 @@ class ConversationStore:
             except ValueError:
                 pass
             if self._conn is not None:
-                # 依赖 ON DELETE CASCADE 自动清 messages
                 self._conn.execute(
                     "DELETE FROM conversations WHERE session_id = ?",
                     (session_id,),
@@ -268,9 +242,25 @@ class ConversationStore:
                 return None
             conv.append(message)
             if self._conn is not None:
+                extra_data = {}
+                if message.name:
+                    extra_data["name"] = message.name
+                if message.tool_call_id:
+                    extra_data["tool_call_id"] = message.tool_call_id
+                if message.tool_calls:
+                    extra_data["tool_calls"] = [
+                        tc.model_dump() for tc in message.tool_calls
+                    ]
+                extra_json = json.dumps(extra_data) if extra_data else None
                 self._conn.execute(
-                    "INSERT INTO messages(session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                    (session_id, message.role, message.content, conv.updated_at),
+                    "INSERT INTO messages(session_id, role, content, extra_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        message.role,
+                        message.content,
+                        extra_json,
+                        conv.updated_at,
+                    ),
                 )
                 self._touch_updated_at(session_id)
             return conv
@@ -285,16 +275,26 @@ class ConversationStore:
             conv.extend(messages)
             if self._conn is not None:
                 now = int(time.time())
+                rows = []
+                for m in messages:
+                    extra_data = {}
+                    if m.name:
+                        extra_data["name"] = m.name
+                    if m.tool_call_id:
+                        extra_data["tool_call_id"] = m.tool_call_id
+                    if m.tool_calls:
+                        extra_data["tool_calls"] = [
+                            tc.model_dump() for tc in m.tool_calls
+                        ]
+                    extra_json = json.dumps(extra_data) if extra_data else None
+                    rows.append((session_id, m.role, m.content, extra_json, now))
                 self._conn.executemany(
-                    "INSERT INTO messages(session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                    [(session_id, m.role, m.content, now) for m in messages],
+                    "INSERT INTO messages(session_id, role, content, extra_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    rows,
                 )
                 self._touch_updated_at(session_id)
             return conv
 
-    # ------------------------------------------------------------------
-    # 只读
-    # ------------------------------------------------------------------
     def get(self, session_id: str) -> Optional[Conversation]:
         with self._lock:
             return self._store.get(session_id)
@@ -304,3 +304,6 @@ class ConversationStore:
             items = [self._store[sid] for sid in self._order if sid in self._store]
             items.sort(key=lambda c: c.updated_at, reverse=True)
             return items
+
+
+__all__ = ["ConversationStore"]

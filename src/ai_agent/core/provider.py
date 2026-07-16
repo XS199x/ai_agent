@@ -1,53 +1,89 @@
-"""Provider 基类和工具提供者接口。
-
-设计原则：
-1. Provider 只提供资源，不执行
-2. 所有 Provider 共享 setup/teardown/health 生命周期
-3. 工具相关的 Provider 在此定义
-"""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from ai_agent.models.action import Action
 from ai_agent.tools.base import BaseTool
 
 
 class Provider(ABC):
-    """所有 Provider 的基类。"""
-
-    @abstractmethod
-    async def setup(self) -> None:
-        """初始化 Provider。"""
-        pass
-
-    @abstractmethod
-    async def teardown(self) -> None:
-        """清理资源。"""
-        pass
-
-    @abstractmethod
+    async def setup(self) -> None: ...
+    async def teardown(self) -> None: ...
     async def health(self) -> bool:
-        """健康检查。"""
-        pass
+        return True
 
 
 class ToolProvider(Provider):
-    """工具提供者接口。"""
+    @abstractmethod
+    def get_tool(self, name: str) -> Optional["BaseTool"]: ...
 
     @abstractmethod
+    def list_tools(self) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def as_actions(self) -> List[Action]: ...
+
+
+class CompositeToolProvider(ToolProvider):
+    def __init__(self, providers: Iterable[ToolProvider]):
+        self._providers: List[ToolProvider] = [p for p in providers if p is not None]
+
+    async def setup(self) -> None:
+        errors: List[str] = []
+        for p in self._providers:
+            try:
+                await p.setup()
+            except Exception as e:
+                errors.append(f"{type(p).__name__}.setup failed: {e}")
+        if errors and not self._providers:
+            raise RuntimeError("; ".join(errors))
+
+    async def teardown(self) -> None:
+        for p in self._providers:
+            try:
+                await p.teardown()
+            except Exception:
+                pass
+
+    async def health(self) -> bool:
+        if not self._providers:
+            return False
+        for p in self._providers:
+            try:
+                if await p.health():
+                    return True
+            except Exception:
+                pass
+        return False
+
     def get_tool(self, name: str) -> Optional["BaseTool"]:
-        """根据名称获取工具。"""
-        pass
+        for p in self._providers:
+            tool = p.get_tool(name)
+            if tool is not None:
+                return tool
+        return None
 
-    @abstractmethod
     def list_tools(self) -> List[Dict[str, Any]]:
-        """列出所有可用工具（包含名称、描述、参数）。"""
-        pass
+        seen: set[str] = set()
+        out: List[Dict[str, Any]] = []
+        for p in self._providers:
+            for desc in p.list_tools():
+                name = desc.get("name") if isinstance(desc, dict) else None
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                out.append(desc)
+        return out
 
-    @abstractmethod
     def as_actions(self) -> List[Action]:
-        """把工具列表转换成 Action 列表。"""
-        pass
+        seen: set[str] = set()
+        out: List[Action] = []
+        for p in self._providers:
+            for act in p.as_actions():
+                nm = getattr(act, "name", None)
+                if not nm or nm in seen:
+                    continue
+                seen.add(nm)
+                out.append(act)
+        return out

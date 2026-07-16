@@ -41,22 +41,33 @@ class DeepSeekLLM(BaseLLM):
                 raise ValueError(
                     f"角色 '{msg.role}' 对 DeepSeek 无效，有效角色: {sorted(_VALID_ROLES)}"
                 )
-            # 防御性处理：role=tool 但没有 tool_call_id → 降级为 role=assistant
-            # DeepSeek/OpenAI 的 tool role 是原生 function calling 配套设施，
-            # 我们的 Planner 用的是 LLM 文本决策，天然没有 tool_calls 链。
             if msg.role == "tool" and not msg.tool_call_id:
                 prefix = (
                     f"[工具 {msg.name or 'unknown'} 结果] "
                     if msg.name
                     else "[工具结果] "
                 )
-                base_item = {"role": "assistant", "content": prefix + msg.content}
+                base_item = {"role": "assistant", "content": prefix + (msg.content or "")}
             else:
-                base_item = {"role": msg.role, "content": msg.content}
+                base_item = {"role": msg.role}
+                if msg.content:
+                    base_item["content"] = msg.content
                 if msg.name:
                     base_item["name"] = msg.name
                 if msg.tool_call_id:
                     base_item["tool_call_id"] = msg.tool_call_id
+                if msg.tool_calls:
+                    base_item["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in msg.tool_calls
+                    ]
             item = cast(ChatCompletionMessageParam, base_item)
             result.append(item)
         return result
