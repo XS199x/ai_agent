@@ -1,4 +1,4 @@
-"""AgentRuntime：控制Agent的推理循环和事件发布。"""
+"""AgentRuntime: Control loop and event emission."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from ai_agent.models.runtime import ExecutionResult, RuntimeEvent
 
 
 class AgentRuntime:
-    """Agent运行时：只负责循环控制、事件发布、上下文流转。"""
+    """Agent runtime: only responsible for loop control, event dispatch, context flow."""
 
     def __init__(
         self,
@@ -32,6 +32,11 @@ class AgentRuntime:
         self._bus = bus
         self._policy = policy or RuntimePolicy()
 
+    @staticmethod
+    def _emit(event_bus: Optional[EventBus], event: RuntimeEvent) -> None:
+        if event_bus is not None:
+            event_bus.emit(event)
+
     async def run(
         self,
         session_id: str,
@@ -44,13 +49,9 @@ class AgentRuntime:
         start_time = time.time()
         iteration = 0
 
-        async def emit(event: RuntimeEvent) -> None:
-            if event_bus is not None:
-                event_bus.emit(event)
-
         try:
             context = await self._context_manager.build_initial(session_id, user_input)
-            await emit(RuntimeEvent.started(session_id))
+            self._emit(event_bus, RuntimeEvent.started(session_id))
 
             while True:
                 token.raise_if_cancelled()
@@ -59,28 +60,32 @@ class AgentRuntime:
                     iteration, time.time() - start_time, token
                 )
                 if not policy_result.allowed:
-                    await emit(
+                    self._emit(
+                        event_bus,
                         RuntimeEvent.create_error(
                             session_id,
                             iteration,
                             policy_result.reason or "policy denied",
-                        )
+                        ),
                     )
                     return ExecutionResult.from_error(
                         policy_result.reason or "policy denied", ""
                     )
 
                 iteration += 1
-                await emit(RuntimeEvent.iteration(session_id, iteration))
+                self._emit(
+                    event_bus, RuntimeEvent.iteration_event(session_id, iteration)
+                )
 
                 action = await self._planner.plan(context, token)
-                await emit(
+                self._emit(
+                    event_bus,
                     RuntimeEvent.decision(
                         session_id,
                         iteration,
                         action_type=type(action).__name__,
                         thought=action.thought,
-                    )
+                    ),
                 )
 
                 result = await self._executor.execute(
@@ -92,41 +97,41 @@ class AgentRuntime:
                     event_bus=event_bus,
                 )
 
-                for event in result.metadata.get("events", []):
-                    await emit(event)
-
                 context = await self._context_manager.consume(context, action, result)
 
                 if not result.should_continue:
                     if result.is_success:
                         answer = result.output if isinstance(result.output, str) else ""
-                        await emit(
+                        self._emit(
+                            event_bus,
                             RuntimeEvent.done(
                                 session_id, iteration, success=True, answer=answer
-                            )
+                            ),
                         )
                     else:
-                        await emit(
-                            RuntimeEvent.done(
-                                session_id,
-                                iteration,
-                                success=False,
-                                message=result.error,
-                            )
+                        self._emit(
+                            event_bus,
+                            RuntimeEvent.create_error(
+                                session_id, iteration, result.error or "unknown error"
+                            ),
                         )
                     return result
 
         except asyncio.CancelledError:
-            await emit(RuntimeEvent.create_error(session_id, iteration, "cancelled"))
+            self._emit(
+                event_bus, RuntimeEvent.create_error(session_id, iteration, "cancelled")
+            )
             return ExecutionResult.from_error("cancelled")
         except Exception as e:
-            await emit(RuntimeEvent.create_error(session_id, iteration, str(e)))
+            self._emit(
+                event_bus, RuntimeEvent.create_error(session_id, iteration, str(e))
+            )
             return ExecutionResult.from_error(str(e))
 
     async def run_stream(
         self, session_id: str, user_input: str
     ) -> AsyncGenerator[StreamItem, None]:
-        """流式执行：将运行时事件转换为StreamItem流。"""
+        """Stream execution: convert runtime events to StreamItem flow."""
         from ai_agent.core.observer import StreamEventObserver
 
         session_bus = EventBus()

@@ -1,12 +1,16 @@
 import asyncio
-from typing import Any, List, Optional
+from typing import Any, Optional
 
-from ai_agent.core.event import Event
 from ai_agent.core.policy import CancellationToken, RetryPolicy
 from ai_agent.core.provider import ToolProvider
 from ai_agent.models.action import Action, AnswerAction, ErrorAction, ToolAction
 from ai_agent.models.context import AgentContext
-from ai_agent.models.runtime import ExecutionOutcome, ExecutionResult, RuntimeEvent
+from ai_agent.models.runtime import (
+    ExecutionOutcome,
+    ExecutionResult,
+    RuntimeEvent,
+    RuntimeEventType,
+)
 
 
 class ActionExecutor:
@@ -30,24 +34,26 @@ class ActionExecutor:
         event_bus: Any = None,
     ) -> ExecutionResult:
         token = token or CancellationToken()
-        events: List[RuntimeEvent] = []
         common = {
             "action_trace_id": getattr(action, "trace_id", ""),
-            "metadata": {"events": events},
         }
 
         try:
             if isinstance(action, ToolAction):
                 token.raise_if_cancelled()
-                events.append(
-                    RuntimeEvent.tool_call(
-                        session_id, iteration, action.name, action.args
+                if event_bus is not None:
+                    event_bus.emit(
+                        RuntimeEvent.tool_call(
+                            session_id, iteration, action.name, action.args
+                        )
                     )
-                )
                 output = await self._execute_tool(action, token)
-                events.append(
-                    RuntimeEvent.tool_result(session_id, iteration, action.name, output)
-                )
+                if event_bus is not None:
+                    event_bus.emit(
+                        RuntimeEvent.tool_result(
+                            session_id, iteration, action.name, output
+                        )
+                    )
                 return ExecutionResult.success(
                     output, ExecutionOutcome.CONTINUE, **common
                 )
@@ -84,18 +90,21 @@ class ActionExecutor:
         if tool is None:
             raise ValueError(f"找不到工具: {action.name}")
 
-        last_error: Optional[Exception] = None
-        delays = list(self._retry_policy.delays())
-        for i, delay in enumerate(delays):
+        token.raise_if_cancelled()
+        try:
+            return tool.run(action.args)
+        except Exception as e:
+            last_error = e
+
+        for delay in self._retry_policy.delays():
             token.raise_if_cancelled()
+            await asyncio.sleep(delay)
             try:
                 return tool.run(action.args)
             except Exception as e:
                 last_error = e
-                if i < len(delays) - 1:
-                    await asyncio.sleep(delay)
 
-        raise last_error if last_error else RuntimeError(f"工具 {action.name} 执行失败")
+        raise last_error
 
     async def _generate_final_answer(
         self,
@@ -104,20 +113,13 @@ class ActionExecutor:
         event_bus: Any = None,
         session_id: str = "",
     ) -> str:
-        from ai_agent.models.chat import ChatMessage
+        from ai_agent.core.message_builder import build_messages
         from ai_agent.prompts.prompt_loader import load_prompt
 
         token.raise_if_cancelled()
         system_prompt = load_prompt("answer", default="你是一个智能助手。")
 
-        messages: list[ChatMessage] = [
-            ChatMessage(role="system", content=system_prompt)
-        ]
-        messages.extend(
-            ChatMessage(role=m.role, content=m.content or "")
-            for m in context.conversation
-            if m.role in ("user", "assistant") and m.content
-        )
+        messages = build_messages(context, system_prompt, include_tool_messages=False)
 
         parts: list[str] = []
         try:
@@ -131,10 +133,10 @@ class ActionExecutor:
                     parts.append(delta)
                     if event_bus is not None:
                         event_bus.emit(
-                            Event(
-                                name="llm.token",
-                                payload={"delta": delta, "session_id": session_id},
+                            RuntimeEvent(
+                                type=RuntimeEventType.TOKEN,
                                 session_id=session_id,
+                                _data={"delta": delta},
                             )
                         )
         except Exception:

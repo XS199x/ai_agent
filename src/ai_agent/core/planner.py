@@ -2,6 +2,7 @@ import asyncio
 import json
 from typing import Any, List, Optional
 
+from ai_agent.core.message_builder import build_messages
 from ai_agent.core.policy import CancellationToken
 from ai_agent.core.provider import ToolProvider
 from ai_agent.llm.base import BaseLLM
@@ -54,26 +55,7 @@ class Planner:
             return error_action(f"Planner 决策失败：{str(e)}")
 
     def _build_messages(self, context: AgentContext) -> List[ChatMessage]:
-        system_content = self._system_prompt
-        snippets = (getattr(context, "system_prompt_snippets", "") or "").strip()
-        if snippets:
-            system_content = f"{system_content.rstrip()}\n\n{snippets}"
-
-        messages: List[ChatMessage] = [
-            ChatMessage(role="system", content=system_content)
-        ]
-
-        last_has_tool_calls = False
-        for msg in context.conversation:
-            if msg.role == "tool":
-                if last_has_tool_calls:
-                    messages.append(msg)
-                last_has_tool_calls = False
-            else:
-                messages.append(msg)
-                last_has_tool_calls = bool(msg.tool_calls)
-
-        return messages
+        return build_messages(context, self._system_prompt, include_tool_messages=True)
 
     def _resolve_tools(
         self, context: AgentContext, token: CancellationToken
@@ -82,7 +64,9 @@ class Planner:
             return []
 
         available_names = {
-            action.name for action in context.available_actions if hasattr(action, "name")
+            action.name
+            for action in context.available_actions
+            if hasattr(action, "name")
         }
         if not available_names:
             return []
@@ -120,7 +104,9 @@ class Planner:
                         thought="LLM 认为可以直接回答用户",
                     )
 
-            return answer_action(content="无法理解您的请求", thought="LLM 返回格式不明确")
+            return answer_action(
+                content="无法理解您的请求", thought="LLM 返回格式不明确"
+            )
         except Exception as e:
             return error_action(f"解析 LLM 返回失败：{str(e)}")
 
@@ -130,9 +116,9 @@ class Planner:
                 message = response.choices[0].message
                 content = getattr(message, "content", "")
                 if content:
-                    return answer_action(
-                        content=content, thought="LLM 直接回答用户"
-                    )
-            return answer_action(content="无法理解您的请求", thought="LLM 返回格式不明确")
+                    return answer_action(content=content, thought="LLM 直接回答用户")
+            return answer_action(
+                content="无法理解您的请求", thought="LLM 返回格式不明确"
+            )
         except Exception as e:
             return error_action(f"解析 LLM 返回失败：{str(e)}")

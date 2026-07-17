@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from ai_agent.core.event import Event, EventBus
+from ai_agent.models.runtime import RuntimeEvent
 
 
 @dataclass
@@ -65,20 +66,15 @@ class StreamItem:
 
 
 class StreamHandle:
-    _SENTINEL_DONE = object()
-
     def __init__(
         self, bus: Optional[EventBus] = None, session_id: Optional[str] = None
     ) -> None:
         self._bus = bus
         self._session_id = session_id
-        self._queue: asyncio.Queue = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[StreamItem]] = asyncio.Queue()
         self._done = False
         self._full_text: str = ""
         self._token_count: int = 0
-        self._start_time: float = 0.0
-        self._success: bool = False
-        self._error: Optional[str] = None
         self.has_produced: bool = False
 
     @property
@@ -93,18 +89,6 @@ class StreamHandle:
     def done(self) -> bool:
         return self._done
 
-    @property
-    def start_time(self) -> float:
-        return self._start_time
-
-    @property
-    def success(self) -> bool:
-        return self._success
-
-    @property
-    def error(self) -> Optional[str]:
-        return self._error
-
     def emit_token(
         self, delta: str, raw_chunk: Optional[Dict[str, Any]] = None
     ) -> None:
@@ -118,9 +102,8 @@ class StreamHandle:
         )
         if self._bus is not None:
             self._bus.emit(
-                Event(
-                    name="llm.token",
-                    payload={"session_id": self._session_id, "delta_len": len(delta)},
+                RuntimeEvent.llm_token(
+                    session_id=self._session_id, delta_len=len(delta)
                 )
             )
 
@@ -137,24 +120,19 @@ class StreamHandle:
         )
         if self._bus is not None:
             self._bus.emit(
-                Event(
-                    name="llm.done",
-                    payload={
-                        "session_id": self._session_id,
-                        "token_count": self._token_count,
-                        "len": len(self._full_text),
-                        **(meta or {}),
-                    },
+                RuntimeEvent.llm_done(
+                    session_id=self._session_id,
+                    token_count=self._token_count,
+                    full_text_len=len(self._full_text),
+                    **(meta or {}),
                 )
             )
-        self._queue.put_nowait(self._SENTINEL_DONE)
+        self._queue.put_nowait(None)
 
     def finish_success(self, **kwargs) -> None:
-        self._success = True
         self.emit_done({"success": True, **kwargs})
 
     def finish_error(self, message: str) -> None:
-        self._error = message
         self.emit_error(message)
 
     def emit_error(self, message: str) -> None:
@@ -166,12 +144,9 @@ class StreamHandle:
         )
         if self._bus is not None:
             self._bus.emit(
-                Event(
-                    name="llm.error",
-                    payload={"session_id": self._session_id, "message": message},
-                )
+                RuntimeEvent.llm_error(session_id=self._session_id, message=message)
             )
-        self._queue.put_nowait(self._SENTINEL_DONE)
+        self._queue.put_nowait(None)
 
     def emit_event(self, name: str, payload: Optional[Dict[str, Any]] = None) -> None:
         if self._done:
@@ -186,7 +161,7 @@ class StreamHandle:
     async def stream(self) -> AsyncGenerator[StreamItem, None]:
         while True:
             item = await self._queue.get()
-            if item is self._SENTINEL_DONE:
+            if item is None:
                 return
             yield item
 

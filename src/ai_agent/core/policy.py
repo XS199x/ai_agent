@@ -49,11 +49,8 @@ class RetryPolicy:
     backoff_factor: float = 2.0
 
     def delays(self) -> Iterator[float]:
-        for attempt in range(self.max_retries + 1):
-            if attempt == 0:
-                yield 0.0
-            else:
-                yield self.delay_seconds * (self.backoff_factor ** (attempt - 1))
+        for attempt in range(self.max_retries):
+            yield self.delay_seconds * (self.backoff_factor ** attempt)
 
 
 @dataclass

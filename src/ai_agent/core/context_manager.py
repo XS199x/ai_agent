@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any, Dict, List, Optional, Protocol
 
 from ai_agent.core.event import Event
@@ -6,6 +7,8 @@ from ai_agent.models.action import Action, AnswerAction, ErrorAction, ToolAction
 from ai_agent.models.chat import ChatMessage, FunctionCall, ToolCall
 from ai_agent.models.context import AgentContext, MemorySnapshot, RuntimeState
 from ai_agent.models.runtime import ExecutionResult
+
+_logger = logging.getLogger(__name__)
 
 
 class ContextProvider(Protocol):
@@ -33,8 +36,8 @@ class ContextManager:
         for provider in self._providers:
             try:
                 data.update(await provider.provide(session_id, user_input))
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.warning("Provider %s failed: %s", provider, e)
 
         return AgentContext(
             conversation=data.get("conversation", []),

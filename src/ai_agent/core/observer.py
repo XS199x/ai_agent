@@ -1,6 +1,6 @@
 import asyncio
 
-from ai_agent.core.event import Event
+from ai_agent.core.event import EventLike
 from ai_agent.core.stream import StreamHandle
 from ai_agent.models.runtime import RuntimeEventType
 
@@ -12,7 +12,7 @@ class StreamEventObserver:
         self._handle = handle
         self._replay_task: asyncio.Task | None = None
 
-    def __call__(self, event: Event) -> None:
+    def __call__(self, event: EventLike) -> None:
         if self._handle.done:
             return
 
@@ -36,10 +36,10 @@ class StreamEventObserver:
         elif name == RuntimeEventType.ERROR.value:
             self._handle.emit_error(payload.get("message", "unknown error"))
 
-        elif name == "llm.token":
+        elif name == RuntimeEventType.TOKEN.value:
             self._handle.emit_token(payload.get("delta", ""))
 
-        elif name == "llm.done":
+        elif name == RuntimeEventType.LLM_DONE.value:
             self._handle.emit_done(payload)
 
         elif name and name.startswith("agent."):
