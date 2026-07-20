@@ -257,7 +257,7 @@ class ConversationStore:
                     (
                         session_id,
                         message.role,
-                        message.content,
+                        message.content or "",
                         extra_json,
                         conv.updated_at,
                     ),
@@ -287,7 +287,7 @@ class ConversationStore:
                             tc.model_dump() for tc in m.tool_calls
                         ]
                     extra_json = json.dumps(extra_data) if extra_data else None
-                    rows.append((session_id, m.role, m.content, extra_json, now))
+                    rows.append((session_id, m.role, m.content or "", extra_json, now))
                 self._conn.executemany(
                     "INSERT INTO messages(session_id, role, content, extra_json, created_at) VALUES (?, ?, ?, ?, ?)",
                     rows,

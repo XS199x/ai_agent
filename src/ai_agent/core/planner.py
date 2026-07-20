@@ -6,7 +6,13 @@ from ai_agent.core.message_builder import build_messages
 from ai_agent.core.policy import CancellationToken
 from ai_agent.core.provider import ToolProvider
 from ai_agent.llm.base import BaseLLM
-from ai_agent.models.action import Action, answer_action, error_action, tool_action
+from ai_agent.models.action import (
+    Action,
+    ToolAction,
+    answer_action,
+    error_action,
+    tool_action,
+)
 from ai_agent.models.chat import ChatMessage
 from ai_agent.models.context import AgentContext
 
@@ -24,7 +30,7 @@ class Planner:
 
         self._llm = llm
         self._tool_provider = tool_provider
-        self._has_native_tools = hasattr(llm, "chat_with_tools")
+        self._has_native_tools = callable(getattr(llm, "chat_with_tools", None))
         self._system_prompt = system_prompt or load_prompt(
             "agent_system", default=self.DEFAULT_FALLBACK
         )
@@ -66,7 +72,7 @@ class Planner:
         available_names = {
             action.name
             for action in context.available_actions
-            if hasattr(action, "name")
+            if isinstance(action, ToolAction)
         }
         if not available_names:
             return []

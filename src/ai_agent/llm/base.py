@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, List, Optional
 
 from ai_agent.config import LLMConfig
 from ai_agent.models.chat import (
@@ -19,6 +19,16 @@ class BaseLLM(ABC):
         temperature: Optional[float] = None,
     ) -> ChatCompletionResponse:
         pass
+
+    def chat_with_tools(
+        self,
+        messages: List[ChatMessage],
+        tools: List[Any],
+        **kwargs: Any,
+    ):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support native tool calling"
+        )
 
     @abstractmethod
     def chat_stream(

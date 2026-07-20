@@ -1,3 +1,5 @@
+from ai_agent.models.runtime import Event
+
 from .action_executor import ActionExecutor
 from .agent_runtime import AgentRuntime
 from .application_profile import ApplicationProfile
@@ -8,7 +10,7 @@ from .context_provider import (
     MemoryProvider,
     RuntimeProvider,
 )
-from .event import Event, EventBus, get_default_bus
+from .event import EventBus, get_default_bus
 from .handlers import (
     ConversationPersistHandler,
     FileLogHandler,

@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from ai_agent.config import config
 from ai_agent.core.action_executor import ActionExecutor
 from ai_agent.core.agent_runtime import AgentRuntime
 from ai_agent.core.application_profile import ApplicationProfile
@@ -18,7 +19,6 @@ from ai_agent.core.policy import RuntimePolicy
 from ai_agent.core.provider import CompositeToolProvider
 from ai_agent.llm.base import BaseLLM
 from ai_agent.llm.factory import create_llm
-from ai_agent.persistence.models import Conversation
 from ai_agent.persistence.store import ConversationStore
 from ai_agent.skills.base import BaseSkill, SkillManager
 from ai_agent.tools.base import ToolRegistry
@@ -31,7 +31,6 @@ from ai_agent.tools.text_stats_tool import TextStatsTool
 _project_root = Path(__file__).resolve().parent.parent.parent
 _persist_path = _project_root / "data" / "conversations.db"
 _max_conversations = 100
-_max_agent_iterations = 5
 
 
 def _default_profiles() -> Dict[str, ApplicationProfile]:
@@ -40,7 +39,7 @@ def _default_profiles() -> Dict[str, ApplicationProfile]:
             "agent",
             system_prompt="agent_system",
             tools=["calculator", "datetime", "text_stats"],
-            max_iterations=_max_agent_iterations,
+            max_iterations=config.agent.max_iterations,
         ),
     }
 

@@ -4,8 +4,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, Optional
 
-from ai_agent.core.event import Event, EventBus
-from ai_agent.models.runtime import RuntimeEvent
+from ai_agent.core.event import EventBus
+from ai_agent.models.runtime import Event
 
 
 @dataclass
@@ -102,9 +102,7 @@ class StreamHandle:
         )
         if self._bus is not None:
             self._bus.emit(
-                RuntimeEvent.llm_token(
-                    session_id=self._session_id, delta_len=len(delta)
-                )
+                Event.llm_token(session_id=self._session_id, delta_len=len(delta))
             )
 
     def emit_done(self, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -120,7 +118,7 @@ class StreamHandle:
         )
         if self._bus is not None:
             self._bus.emit(
-                RuntimeEvent.llm_done(
+                Event.llm_done(
                     session_id=self._session_id,
                     token_count=self._token_count,
                     full_text_len=len(self._full_text),
@@ -144,7 +142,7 @@ class StreamHandle:
         )
         if self._bus is not None:
             self._bus.emit(
-                RuntimeEvent.llm_error(session_id=self._session_id, message=message)
+                Event.llm_error(session_id=self._session_id, message=message)
             )
         self._queue.put_nowait(None)
 

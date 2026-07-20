@@ -11,8 +11,7 @@ from ai_agent.core.event import EventBus
 from ai_agent.core.planner import Planner
 from ai_agent.core.policy import CancellationToken, RuntimePolicy
 from ai_agent.core.stream import StreamHandle, StreamItem
-from ai_agent.models.context import AgentContext
-from ai_agent.models.runtime import ExecutionResult, RuntimeEvent
+from ai_agent.models.runtime import Event, ExecutionOutcome, ExecutionResult
 
 
 class AgentRuntime:
@@ -33,7 +32,7 @@ class AgentRuntime:
         self._policy = policy or RuntimePolicy()
 
     @staticmethod
-    def _emit(event_bus: Optional[EventBus], event: RuntimeEvent) -> None:
+    def _emit(event_bus: Optional[EventBus], event: Event) -> None:
         if event_bus is not None:
             event_bus.emit(event)
 
@@ -51,7 +50,7 @@ class AgentRuntime:
 
         try:
             context = await self._context_manager.build_initial(session_id, user_input)
-            self._emit(event_bus, RuntimeEvent.started(session_id))
+            self._emit(event_bus, Event.started(session_id))
 
             while True:
                 token.raise_if_cancelled()
@@ -62,25 +61,24 @@ class AgentRuntime:
                 if not policy_result.allowed:
                     self._emit(
                         event_bus,
-                        RuntimeEvent.create_error(
+                        Event.create_error(
                             session_id,
                             iteration,
                             policy_result.reason or "policy denied",
                         ),
                     )
                     return ExecutionResult.from_error(
-                        policy_result.reason or "policy denied", ""
+                        policy_result.reason or "policy denied",
+                        ExecutionOutcome.STOP,
                     )
 
                 iteration += 1
-                self._emit(
-                    event_bus, RuntimeEvent.iteration_event(session_id, iteration)
-                )
+                self._emit(event_bus, Event.iteration_event(session_id, iteration))
 
                 action = await self._planner.plan(context, token)
                 self._emit(
                     event_bus,
-                    RuntimeEvent.decision(
+                    Event.decision(
                         session_id,
                         iteration,
                         action_type=type(action).__name__,
@@ -104,14 +102,14 @@ class AgentRuntime:
                         answer = result.output if isinstance(result.output, str) else ""
                         self._emit(
                             event_bus,
-                            RuntimeEvent.done(
+                            Event.done(
                                 session_id, iteration, success=True, answer=answer
                             ),
                         )
                     else:
                         self._emit(
                             event_bus,
-                            RuntimeEvent.create_error(
+                            Event.create_error(
                                 session_id, iteration, result.error or "unknown error"
                             ),
                         )
@@ -119,13 +117,11 @@ class AgentRuntime:
 
         except asyncio.CancelledError:
             self._emit(
-                event_bus, RuntimeEvent.create_error(session_id, iteration, "cancelled")
+                event_bus, Event.create_error(session_id, iteration, "cancelled")
             )
             return ExecutionResult.from_error("cancelled")
         except Exception as e:
-            self._emit(
-                event_bus, RuntimeEvent.create_error(session_id, iteration, str(e))
-            )
+            self._emit(event_bus, Event.create_error(session_id, iteration, str(e)))
             return ExecutionResult.from_error(str(e))
 
     async def run_stream(

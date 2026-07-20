@@ -6,11 +6,11 @@ from ai_agent.core.provider import ToolProvider
 from ai_agent.models.action import Action, AnswerAction, ErrorAction, ToolAction
 from ai_agent.models.context import AgentContext
 from ai_agent.models.runtime import (
+    Event,
     ExecutionOutcome,
     ExecutionResult,
-    RuntimeEvent,
-    RuntimeEventType,
 )
+from ai_agent.tools.base import ToolResult
 
 
 class ActionExecutor:
@@ -43,16 +43,12 @@ class ActionExecutor:
                 token.raise_if_cancelled()
                 if event_bus is not None:
                     event_bus.emit(
-                        RuntimeEvent.tool_call(
-                            session_id, iteration, action.name, action.args
-                        )
+                        Event.tool_call(session_id, iteration, action.name, action.args)
                     )
                 output = await self._execute_tool(action, token)
                 if event_bus is not None:
                     event_bus.emit(
-                        RuntimeEvent.tool_result(
-                            session_id, iteration, action.name, output
-                        )
+                        Event.tool_result(session_id, iteration, action.name, output)
                     )
                 return ExecutionResult.success(
                     output, ExecutionOutcome.CONTINUE, **common
@@ -91,20 +87,24 @@ class ActionExecutor:
             raise ValueError(f"找不到工具: {action.name}")
 
         token.raise_if_cancelled()
-        try:
-            return tool.run(action.args)
-        except Exception as e:
-            last_error = e
+        result = self._execute_once(tool, action.args)
+        if result.success:
+            return result.output
 
+        last_error_msg = result.error or "未知错误"
         for delay in self._retry_policy.delays():
             token.raise_if_cancelled()
             await asyncio.sleep(delay)
-            try:
-                return tool.run(action.args)
-            except Exception as e:
-                last_error = e
+            result = self._execute_once(tool, action.args)
+            if result.success:
+                return result.output
+            last_error_msg = result.error or "未知错误"
 
-        raise last_error
+        raise RuntimeError(last_error_msg)
+
+    @staticmethod
+    def _execute_once(tool, args: dict) -> "ToolResult":
+        return tool.execute(args)
 
     async def _generate_final_answer(
         self,
@@ -133,10 +133,10 @@ class ActionExecutor:
                     parts.append(delta)
                     if event_bus is not None:
                         event_bus.emit(
-                            RuntimeEvent(
-                                type=RuntimeEventType.TOKEN,
+                            Event.llm_token(
                                 session_id=session_id,
-                                _data={"delta": delta},
+                                delta_len=len(delta),
+                                delta=delta,
                             )
                         )
         except Exception:

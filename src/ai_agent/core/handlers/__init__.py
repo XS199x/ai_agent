@@ -7,7 +7,7 @@ import traceback
 from datetime import datetime
 from typing import Any, Optional
 
-from ai_agent.core.event import Event
+from ai_agent.models.runtime import Event
 
 
 class PrintLogHandler:

@@ -3,10 +3,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from ai_agent.core.context_manager import ContextProvider
-from ai_agent.core.event import Event
 from ai_agent.core.provider import ToolProvider
 from ai_agent.models.chat import ChatMessage
 from ai_agent.models.context import MemorySnapshot, RuntimeState
+from ai_agent.models.runtime import Event
 from ai_agent.persistence.models import Conversation
 from ai_agent.persistence.store import ConversationStore
 

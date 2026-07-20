@@ -1,28 +1,12 @@
 import asyncio
 import traceback
-from dataclasses import dataclass, field
-from time import time
-from typing import Any, Callable, List, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, List, Optional
+
+if TYPE_CHECKING:
+    from ai_agent.models.runtime import Event
 
 
-@runtime_checkable
-class EventLike(Protocol):
-    name: str
-    payload: dict
-    error: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class Event:
-    name: Optional[str] = None
-    payload: dict = field(default_factory=dict)
-    timestamp: float = field(default_factory=time)
-    error: Optional[str] = None
-    session_id: Optional[str] = None
-    iteration: int = 0
-
-
-Handler = Callable[[EventLike], Any]
+Handler = Callable[["Event"], object]
 
 
 class EventBus:
@@ -32,7 +16,7 @@ class EventBus:
     def subscribe(self, handler: Handler) -> None:
         self._handlers.append(handler)
 
-    def emit(self, event: EventLike) -> None:
+    def emit(self, event: "Event") -> None:
         for h in list(self._handlers):
             try:
                 result = h(event)
@@ -41,7 +25,7 @@ class EventBus:
             except Exception:
                 traceback.print_exc()
 
-    async def emit_async(self, event: EventLike) -> None:
+    async def emit_async(self, event: "Event") -> None:
         for h in list(self._handlers):
             try:
                 result = h(event)
@@ -65,4 +49,4 @@ def get_default_bus() -> EventBus:
     return _default_bus
 
 
-__all__ = ["Event", "EventLike", "EventBus", "get_default_bus"]
+__all__ = ["EventBus", "get_default_bus", "Handler"]

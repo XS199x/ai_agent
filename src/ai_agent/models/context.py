@@ -50,8 +50,6 @@ class RuntimeState:
     session_id: str = ""
     iteration: int = 0
     max_iterations: int = 10
-    timeout_seconds: float = 300.0
-    start_time: float = 0.0
 
 
 @dataclass(frozen=True)

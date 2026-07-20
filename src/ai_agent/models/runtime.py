@@ -1,4 +1,4 @@
-"""Runtime core models: define execution results and runtime events."""
+"""Runtime core models: define execution results and the unified event type."""
 
 from __future__ import annotations
 
@@ -9,23 +9,17 @@ from typing import Any, Dict, Optional
 
 
 class ExecutionStatus(str, Enum):
-    """Execution status."""
-
     SUCCESS = "success"
     ERROR = "error"
 
 
 class ExecutionOutcome(str, Enum):
-    """Execution outcome: decides what to do next."""
-
     CONTINUE = "continue"
     STOP = "stop"
 
 
 @dataclass(frozen=True)
 class ExecutionResult:
-    """Unified execution result wrapper."""
-
     status: ExecutionStatus
     outcome: ExecutionOutcome
     output: Any = None
@@ -64,8 +58,8 @@ class ExecutionResult:
         )
 
 
-class RuntimeEventType(str, Enum):
-    """Runtime event types."""
+class EventName:
+    """Event name constants for type-safe event matching."""
 
     STARTED = "agent.started"
     DECISION = "agent.decision"
@@ -80,54 +74,33 @@ class RuntimeEventType(str, Enum):
 
 
 @dataclass(frozen=True)
-class RuntimeEvent:
-    """Runtime event with strong type safety.
+class Event:
+    """Unified event type for EventBus.
 
-    Independent from Event, has its own field definitions matching
-    Event's required interface for EventBus compatibility.
+    All events have a name and optional payload. The name is always a string,
+    either from EventName constants or a custom identifier.
     """
 
-    type: RuntimeEventType
+    name: str
+    payload: Dict[str, Any] = field(default_factory=dict)
     session_id: Optional[str] = None
     iteration: int = 0
     error: Optional[str] = None
     timestamp: float = field(default_factory=time)
-    _data: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def name(self) -> str:
-        return self.type.value
-
-    @property
-    def payload(self) -> Dict[str, Any]:
-        data = dict(self._data)
-        if self.error is not None:
-            data["error"] = self.error
-        return data
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "type": self.type.value,
-            "session_id": self.session_id,
-            "iteration": self.iteration,
-            "timestamp": self.timestamp,
-            "data": self._data,
-            "error": self.error,
-        }
 
     @classmethod
-    def started(cls, session_id: str, **kwargs) -> "RuntimeEvent":
-        return cls(type=RuntimeEventType.STARTED, session_id=session_id, **kwargs)
+    def started(cls, session_id: str, **kwargs) -> "Event":
+        return cls(name=EventName.STARTED, session_id=session_id, payload=kwargs)
 
     @classmethod
     def decision(
         cls, session_id: str, iteration: int, action_type: str, **kwargs
-    ) -> "RuntimeEvent":
+    ) -> "Event":
         return cls(
-            type=RuntimeEventType.DECISION,
+            name=EventName.DECISION,
             session_id=session_id,
             iteration=iteration,
-            _data={"action_type": action_type, **kwargs},
+            payload={"action_type": action_type, **kwargs},
         )
 
     @classmethod
@@ -138,12 +111,12 @@ class RuntimeEvent:
         tool_name: str,
         tool_args: Dict[str, Any],
         **kwargs,
-    ) -> "RuntimeEvent":
+    ) -> "Event":
         return cls(
-            type=RuntimeEventType.TOOL_CALL,
+            name=EventName.TOOL_CALL,
             session_id=session_id,
             iteration=iteration,
-            _data={"tool": tool_name, "args": tool_args, **kwargs},
+            payload={"tool": tool_name, "args": tool_args, **kwargs},
         )
 
     @classmethod
@@ -154,75 +127,67 @@ class RuntimeEvent:
         tool_name: str,
         observation: Any,
         **kwargs,
-    ) -> "RuntimeEvent":
+    ) -> "Event":
         return cls(
-            type=RuntimeEventType.TOOL_RESULT,
+            name=EventName.TOOL_RESULT,
             session_id=session_id,
             iteration=iteration,
-            _data={"tool": tool_name, "observation": str(observation), **kwargs},
+            payload={"tool": tool_name, "observation": str(observation), **kwargs},
         )
 
     @classmethod
-    def iteration_event(
-        cls, session_id: str, iteration: int, **kwargs
-    ) -> "RuntimeEvent":
+    def iteration_event(cls, session_id: str, iteration: int, **kwargs) -> "Event":
         return cls(
-            type=RuntimeEventType.ITERATION,
+            name=EventName.ITERATION,
             session_id=session_id,
             iteration=iteration,
-            **kwargs,
+            payload=kwargs,
         )
 
     @classmethod
-    def done(
-        cls, session_id: str, iteration: int, success: bool, **kwargs
-    ) -> "RuntimeEvent":
+    def done(cls, session_id: str, iteration: int, success: bool, **kwargs) -> "Event":
         return cls(
-            type=RuntimeEventType.DONE,
+            name=EventName.DONE,
             session_id=session_id,
             iteration=iteration,
-            _data={"success": success, **kwargs},
+            payload={"success": success, **kwargs},
         )
 
     @classmethod
     def create_error(
         cls, session_id: str, iteration: int, message: str, **kwargs
-    ) -> "RuntimeEvent":
+    ) -> "Event":
         return cls(
-            type=RuntimeEventType.ERROR,
+            name=EventName.ERROR,
             session_id=session_id,
             iteration=iteration,
             error=message,
-            **kwargs,
+            payload=kwargs,
         )
 
     @classmethod
-    def llm_token(
-        cls, session_id: Optional[str], delta_len: int, **kwargs
-    ) -> "RuntimeEvent":
+    def llm_token(cls, session_id: Optional[str], delta_len: int, **kwargs) -> "Event":
         return cls(
-            type=RuntimeEventType.TOKEN,
+            name=EventName.TOKEN,
             session_id=session_id,
-            _data={"delta_len": delta_len, **kwargs},
+            payload={"delta_len": delta_len, **kwargs},
         )
 
     @classmethod
     def llm_done(
         cls, session_id: Optional[str], token_count: int, full_text_len: int, **kwargs
-    ) -> "RuntimeEvent":
+    ) -> "Event":
         return cls(
-            type=RuntimeEventType.LLM_DONE,
+            name=EventName.LLM_DONE,
             session_id=session_id,
-            _data={"token_count": token_count, "len": full_text_len, **kwargs},
+            payload={"token_count": token_count, "len": full_text_len, **kwargs},
         )
 
     @classmethod
-    def llm_error(
-        cls, session_id: Optional[str], message: str, **kwargs
-    ) -> "RuntimeEvent":
+    def llm_error(cls, session_id: Optional[str], message: str, **kwargs) -> "Event":
         return cls(
-            type=RuntimeEventType.LLM_ERROR,
+            name=EventName.LLM_ERROR,
             session_id=session_id,
             error=message,
-            **kwargs,
+            payload=kwargs,
         )
